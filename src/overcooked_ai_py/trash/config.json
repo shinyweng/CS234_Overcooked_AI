@@ -1,0 +1,22 @@
+{
+    "seed": 234,
+    "layout_name": "coordination_ring", 
+    "num_agents": 2,
+    "num_batches": 10,
+    "batch_size": 32,
+    "clip_param": 0.069,
+    "gamma": 0.975,
+    "grad_clip": 0.359,
+    "kl_coeff": 0.156,
+    "lmbda": 0.5,
+    "num_episodes": 650,
+    "reward_shaping_factor": 0.1,
+    "num_epochs": 1000,
+    "num_hidden": 64,
+    "learning_rate": 0.01,
+    "horizon": 400
+}
+
+
+
+// clip_param=0.069 gamma=0.975 grad_clip=0.359 kl_coeff=0.156 lmbda=0.5 lr=1.6e-4 num_training_iters=650 old_dynamics=True 
