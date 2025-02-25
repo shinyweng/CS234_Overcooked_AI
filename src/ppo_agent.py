@@ -197,7 +197,8 @@ class PPOTrainer:
 
         # Training loop
         for epoch in range(self.config.num_epochs):
-
+            if epoch % 10 == 0:
+                print(f"Epoch {epoch}")
             state_tensor_p0, state_tensor_p1, action_tensor, sparse_rewards, infos = self.collect_trajectories()
 
             # Compute dense rewards
