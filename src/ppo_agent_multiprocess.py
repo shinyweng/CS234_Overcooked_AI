@@ -1,13 +1,13 @@
 # ppo_agent.py
-import os 
-import argparse
+
 import torch
 import torch.nn as nn
 import numpy as np
+import multiprocessing
 from config import Config
 from tqdm import tqdm, trange
 import wandb
-
+import time
 
 from overcooked_ai_py.mdp.actions import Action
 from torch.distributions import Categorical
@@ -19,11 +19,11 @@ from overcooked_ai_py.agents.agent import Agent, AgentPair
 MAX_WIDTH = 9
 MAX_HEIGHT = 5
 
-def get_obs(env, state):
+def get_obs(mdp, horizon, state):
     """
     Get observation from the environment.
     """
-    encoding = np.array(env.lossless_state_encoding_mdp(state))
+    encoding = np.array(mdp.lossless_state_encoding(state, horizon))
     obs0, obs1 = encoding[0], encoding[1]
     obs0 = np.transpose(obs0, (2, 0, 1)) # permute from (w, h, c) to (c, w, h)
     obs1 = np.transpose(obs1, (2, 0, 1)) # permute from (w, h, c) to (c, w, h)
@@ -83,7 +83,7 @@ class PPOAgent(Agent):
     """
     PPO Agent implementation for Overcooked AI environment.
     """
-    def __init__(self, env, config=None):
+    def __init__(self, mdp, config=None):
         super(PPOAgent, self).__init__()
         
         # Initialize configuration
@@ -91,8 +91,8 @@ class PPOAgent(Agent):
         self.device = self.config.device if config else 'cpu'
         self.action_space = Action.ALL_ACTIONS
 
-        # Storing the env that the agent is in
-        self.env = env
+        # Storing the mdp that the agent is in
+        self.mdp = mdp
         
         # Initialize neural network
         self.network = PPONetwork(
@@ -131,13 +131,16 @@ class PPOAgent(Agent):
         """
         Get action from the current policy.
         """
-        observation = torch.tensor(get_obs(self.env, state)[self.agent_index], dtype=torch.float32).unsqueeze(0)#.to(self.device)
+        observation = torch.tensor(get_obs(self.mdp, self.config.horizon, state)[self.agent_index], dtype=torch.float32).unsqueeze(0)#.to(self.device)
         distribution = self._get_distribution(observation)
         action_idx = distribution.sample()
         og_log_probs = distribution.log_prob(action_idx)
         action = Action.INDEX_TO_ACTION[action_idx.item()]
-        info = {'og_distribution': distribution.probs, 'og_log_probs': og_log_probs}
+        info = {'og_distribution': distribution.probs.detach(), 'og_log_probs': og_log_probs.detach()}
         return action, info 
+    
+    def load_network_state_dict(self, state_dict):
+        self.network.load_state_dict(state_dict)
     
 
     def compute_gae(self, values, rewards):
@@ -189,10 +192,13 @@ class PPOAgent(Agent):
         clipped_ratio = torch.clamp(ratio, 1 - self.config.clip_param, 1 + self.config.clip_param)
         policy_loss = torch.min(ratio * advantages, clipped_ratio * advantages).mean()
 
-
+        print("Returns range", returns.min().item(), returns.max().item())
+        print("Value range", value.min().item(), value.max().item())
+        print("return shape", returns.shape)
 
         # value loss
         assert value.shape == returns.shape # (2000, 1)
+
         # value_loss = -self.value_loss_fn(value, returns)
         value_loss = self.value_loss_fn(value, returns)
     
@@ -218,27 +224,87 @@ class PPOAgent(Agent):
 
 class PPOTrainer:
     """Handles the PPO training process."""
-    def __init__(self, config):
+    def __init__(self, config, pool):
         self.config = config
-        
+        self.pool = pool
         
         # Initialize WandB
-        wandb.init(project="overcooked-ppo", config=self.config.__dict__)
-        
+        # wandb.init(project="overcooked-ppo", config=self.config.__dict__)
         # Initialize environment
         mdp = OvercookedGridworld.from_layout_name(layout_name=self.config.layout)   
         self.env = OvercookedEnv.from_mdp(mdp, horizon=self.config.horizon)
         
         # Initialize agents
-        self.agent0 = PPOAgent(self.env, self.config)
-        self.agent1 = PPOAgent(self.env, self.config)
+        self.agent0 = PPOAgent(self.env.mdp, self.config)
+        self.agent1 = PPOAgent(self.env.mdp, self.config)
         self.agent_pair = AgentPair(self.agent0, self.agent1)
         self.device = self.config.device
+
+    @staticmethod
+    def perform_rollout_wrapper(agent0_statedict, agent1_statedict):
+        global worker_env
+        global worker_agent0
+        global worker_agent1
+        global worker_agent_pair
+
+        worker_agent0.load_network_state_dict(agent0_statedict)
+        worker_agent1.load_network_state_dict(agent1_statedict)
+
+        worker_agent_pair = AgentPair(worker_agent0, worker_agent1)
+        return worker_env.get_rollouts(worker_agent_pair, 6, info=False, display_phi=True)
+
+    def collect_trajectories_parallel(self):
+        # start timer
+        start = time.time()   
+        agent0_state_dict = {k: v.detach().clone() for k, v in self.agent0.network.state_dict().items()}
+        agent1_state_dict = {k: v.detach().clone() for k, v in self.agent1.network.state_dict().items()}
+        parallel_trajectories = self.pool.starmap(self.perform_rollout_wrapper, [(agent0_state_dict, agent1_state_dict)] * 5)
+        # end timer
+        end = time.time()
+        print(f"Time taken to collect parallel trajectories: {end - start}")
+
+        states = np.concatenate([trajectory["ep_states"] for trajectory in parallel_trajectories], axis=0) # shape (num_episodes, num_steps)
+        actions = np.concatenate([trajectory["ep_actions"] for trajectory in parallel_trajectories], axis=0) # shape (num_episodes, num_steps, num_agents, num_actions)
+        rewards = np.concatenate([trajectory["ep_rewards"] for trajectory in parallel_trajectories], axis=0) # shape (num_episodes, num_steps)
+        dones = np.concatenate([trajectory["ep_dones"] for trajectory in parallel_trajectories], axis=0) # shape (num_episodes, num_steps)
+        infos = np.concatenate([trajectory["ep_infos"] for trajectory in parallel_trajectories], axis=0) # shape (num_episodes, num_steps, num_agents)
+
+
+        # Featurize and convert to tensors
+        state_p0 = np.array([[get_obs(self.env.mdp, self.env.horizon, state)[0] for state in episode] for episode in states])
+        state_p1 = np.array([[get_obs(self.env.mdp, self.env.horizon, state)[1] for state in episode] for episode in states])
+        state_tensor_p0 = torch.tensor(state_p0, dtype=torch.float32) # shape (num_episodes, num_steps, num_agents, num_channels, h/w, h/w)
+        state_tensor_p1 = torch.tensor(state_p1, dtype=torch.float32)
+
+        action_tensor = torch.tensor([[[Action.ACTION_TO_INDEX[act] for act in agent_acts] for agent_acts in episode] for episode in actions], dtype=torch.long) # shape (num_episodes, num_steps, num_agents)
+        reward_tensor = torch.tensor(rewards.astype(np.float32), dtype=torch.float32)
+
+        return state_tensor_p0, state_tensor_p1, action_tensor, reward_tensor, infos
+
 
     def collect_trajectories(self):
         """
         Collect trajectories from the environment.
         """
+
+        """
+        initialize our worker pool and give it the environemnt and a copy of the agents each time
+        - either we 
+
+
+        wrapper: get_rollout(i):
+        - returns: env.get_rollouts(length 1)
+
+        pool.map(get_rollouts, range(num_episodes))
+
+        accumulate the individual rollouts
+
+        states = concat[rollout['states'] for rollout in rollouts]
+        ...*
+
+        """
+
+
         trajectories = self.env.get_rollouts(self.agent_pair, self.config.num_episodes, info=True, display_phi=True)
         # print("Trajectories", trajectories)
 
@@ -252,8 +318,8 @@ class PPOTrainer:
         # print("TEST")
         # print(states[0][0])
 
-        state_p0 = np.array([[get_obs(self.env, state)[0] for state in episode] for episode in states])
-        state_p1 = np.array([[get_obs(self.env, state)[1] for state in episode] for episode in states])
+        state_p0 = np.array([[get_obs(self.env.mdp, self.env.horizon, state)[0] for state in episode] for episode in states])
+        state_p1 = np.array([[get_obs(self.env.mdp, self.env.horizon, state)[1] for state in episode] for episode in states])
         state_tensor_p0 = torch.tensor(state_p0, dtype=torch.float32) # shape (num_episodes, num_steps, num_agents, num_channels, h/w, h/w)
         state_tensor_p1 = torch.tensor(state_p1, dtype=torch.float32)
 
@@ -313,11 +379,12 @@ class PPOTrainer:
                 print(f"iter {iter}")
                 
             #### Collect all data ####
-            self.agent0.network.to('cpu')
-            self.agent1.network.to('cpu')
-            state_tensor_p0, state_tensor_p1, action_tensor, sparse_rewards, infos = self.collect_trajectories()
-            self.agent0.network.to(self.device)
-            self.agent1.network.to(self.device)
+            with torch.no_grad():
+                self.agent0.network.to('cpu')
+                self.agent1.network.to('cpu')
+                state_tensor_p0, state_tensor_p1, action_tensor, sparse_rewards, infos = self.collect_trajectories_parallel()
+                self.agent0.network.to(self.device)
+                self.agent1.network.to(self.device)
 
             # Compute dense rewards
             # print("Collecting Rewards")
@@ -339,11 +406,10 @@ class PPOTrainer:
 
             # Compute shaped rewards
             shaped_rewards = sparse_rewards + dense_rewards * self.config.reward_shaping_factor
-
             avg_reward = shaped_rewards.sum(axis=1).mean()
             print("Average reward per episode", avg_reward)
 
-            wandb.log({"Average Reward": avg_reward, "Iteration": iter})
+            # wandb.log({"Average Reward": avg_reward, "Iteration": iter})
 
             # # get old log probs
             # # infos['og_log_probs'] is shape # (num_episodes, num_steps, num_agents)
@@ -412,30 +478,28 @@ class PPOTrainer:
                         self.agent1.update_policy(state_tensor_p1_batch, action_tensor1_batch, returns_batch, old_logprobs=old_log_probs1_batch, entropy_coeff_current=entropy_coeff_current)
                         
                         pbar.update(1)
-
-        wandb.finish()
+                        
+        # wandb.finish()
         print("Reward:", rewards)
         return rewards
-    
+
+
+def worker_init(config):
+    global worker_env
+    global worker_agent0
+    global worker_agent1
+    mdp = OvercookedGridworld.from_layout_name(layout_name=config.layout)
+    worker_env = OvercookedEnv.from_mdp(mdp, horizon=config.horizon)
+
+    worker_agent0 = PPOAgent(worker_env.mdp, config)
+    worker_agent0.network.to('cpu')
+    worker_agent1 = PPOAgent(worker_env.mdp, config)
+    worker_agent1.network.to('cpu')
+
+
 if __name__ == "__main__":  
-    layout_mapping = {
-            1: 'padded_cramped_room', 
-            2: 'padded_asymmetric_advantages_tomato',
-            3: 'padded_coordination_ring', 
-            4: 'padded_forced_coordination', 
-            5: 'padded_counter_circuit'
-    }
+    config = Config()
 
-    parser = argparse.ArgumentParser(description="Train a PPO agent in the Overcooked environment.")
-    parser.add_argument(
-        "--layout", 
-        type=int, 
-        default=1, 
-        choices=["padded_cramped_room", "padded_asymmetric_advantages_tomato", "padded_coordination_ring", "padded_forced_coordination", "padded_counter_circuit"],
-        help="The layout to use for training."
-    )
-
-    args = parser.parse_args()
-    config = Config(layout=layout_mapping[args.layout])
-    trainer = PPOTrainer(config)
-    rewards = trainer.train()
+    with multiprocessing.Pool(5, worker_init, [config]) as pool:
+        trainer = PPOTrainer(config, pool)
+        rewards = trainer.train()

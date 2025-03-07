@@ -1,5 +1,4 @@
 */__pycache__/
 *.py[cod]
 
-# Ignore __pycache__ directories
-**/__pycache__/
+wandb/*
