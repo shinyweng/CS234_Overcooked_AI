@@ -6,7 +6,7 @@ class Config:
         self.normalize_advantage = True
         self.update_freq = 5
         self.horizon = 400
-        self.layout = "cramped_room"
+        self.layout = "padded_cramped_room"
         self.learning_rate = 5e-5  #g
         self.reward_shaping_factor = 0.1 
         self.clip_param = 0.05 #g

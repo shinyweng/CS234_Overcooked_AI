@@ -56,7 +56,7 @@ class PPONetwork(nn.Module):
             nn.Conv2d(in_channels=25, out_channels=25, kernel_size=3, padding="same"),
             nn.LeakyReLU(),
             nn.Flatten(),
-            nn.Linear(150, 32),
+            nn.Linear(525, 32), 
             nn.LeakyReLU(),
             nn.Linear(32, 32),
             nn.LeakyReLU(),
