@@ -129,7 +129,7 @@ class PPOAgent(Agent):
         """
         Get action from the current policy.
         """
-        observation = torch.tensor(get_obs(self.env, state)[self.agent_index], dtype=torch.float32).unsqueeze(0).to(self.device)
+        observation = torch.tensor(get_obs(self.env, state)[self.agent_index], dtype=torch.float32).unsqueeze(0)#.to(self.device)
         distribution = self._get_distribution(observation)
         action_idx = distribution.sample()
         og_log_probs = distribution.log_prob(action_idx)
@@ -231,7 +231,7 @@ class PPOTrainer:
         """
         Collect trajectories from the environment.
         """
-        trajectories = self.env.get_rollouts(self.agent_pair, self.config.num_episodes, info=False, display_phi=True)
+        trajectories = self.env.get_rollouts(self.agent_pair, self.config.num_episodes, info=True, display_phi=True)
         # print("Trajectories", trajectories)
 
         states = trajectories["ep_states"] # shape (num_episodes, num_steps, num_states)
@@ -305,7 +305,11 @@ class PPOTrainer:
                 print(f"iter {iter}")
                 
             #### Collect all data ####
+            self.agent0.network.to('cpu')
+            self.agent1.network.to('cpu')
             state_tensor_p0, state_tensor_p1, action_tensor, sparse_rewards, infos = self.collect_trajectories()
+            self.agent0.network.to(self.device)
+            self.agent1.network.to(self.device)
 
             # Compute dense rewards
             # print("Collecting Rewards")
