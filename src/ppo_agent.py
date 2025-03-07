@@ -25,28 +25,28 @@ def get_obs(env, state):
     obs0, obs1 = encoding[0], encoding[1]
     obs0 = np.transpose(obs0, (2, 0, 1)) # permute from (w, h, c) to (c, w, h)
     obs1 = np.transpose(obs1, (2, 0, 1)) # permute from (w, h, c) to (c, w, h)
-    return obs0, obs1
-    # TODO
-    return pad_obs(obs0), pad_obs(obs1)
+    return obs0, obs1 
+    # return pad_obs(obs0), pad_obs(obs1)
 
-def pad_obs(obs, target_width=MAX_WIDTH, target_height=MAX_HEIGHT): 
-    """"Pad obs from (c,w,h) to (c, max_w, max_h)"""
-    c, w, h = obs.shape
-    width_diff = (target_width - w ) // 2
-    height_diff = (target_height - h) // 2
-    padded = np.pad(obs + 1, (
-        (0, 0), # don't change c
-        (width_diff, target_width - w - width_diff), # middle pad 
-        (height_diff, target_height - h - height_diff) # middle pad 
-    ), mode='constant', constant_values=0)
-    return padded
+# def pad_obs(obs, target_width=MAX_WIDTH, target_height=MAX_HEIGHT): 
+#     """"Pad obs from (c,w,h) to (c, max_w, max_h)"""
+#     c, w, h = obs.shape
+#     width_diff = (target_width - w ) // 2
+#     height_diff = (target_height - h) // 2
+#     padded = np.pad(obs + 1, (
+#         (0, 0), # don't change c
+#         (width_diff, target_width - w - width_diff), # middle pad 
+#         (height_diff, target_height - h - height_diff) # middle pad 
+#     ), mode='constant', constant_values=0)
+#     return padded
     
 class PPONetwork(nn.Module):
     """
     Neural network for PPO agent.
     """
-    def __init__(self, input_channels=26, action_space_size=6):
+    def __init__(self, device, input_channels=26, action_space_size=6):
         super(PPONetwork, self).__init__()
+        self.device = device
         
         self.model_trunk = nn.Sequential(
             nn.Conv2d(in_channels=input_channels, out_channels=25, kernel_size=5, padding="same"),
@@ -62,10 +62,10 @@ class PPONetwork(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(32, 32),
             nn.LeakyReLU(),
-        )
+        ).to(self.device)
 
-        self.action_head = nn.Linear(32, action_space_size)
-        self.value_head = nn.Linear(32, 1)
+        self.action_head = nn.Linear(32, action_space_size).to(self.device)
+        self.value_head = nn.Linear(32, 1).to(self.device)
 
     def forward(self, obs):
         """
@@ -86,6 +86,7 @@ class PPOAgent(Agent):
         
         # Initialize configuration
         self.config = config if config else Config()
+        self.device = self.config.device if config else 'cpu'
         self.action_space = Action.ALL_ACTIONS
 
         # Storing the env that the agent is in
@@ -93,9 +94,10 @@ class PPOAgent(Agent):
         
         # Initialize neural network
         self.network = PPONetwork(
+            device=self.device,
             input_channels=26, 
             action_space_size=len(self.action_space)
-        )
+        ).to(self.device)
 
         # Initialize loss functions
         self.value_loss_fn = nn.MSELoss()
@@ -127,15 +129,30 @@ class PPOAgent(Agent):
         """
         Get action from the current policy.
         """
-        observation = torch.tensor(get_obs(self.env, state)[self.agent_index], dtype=torch.float32).unsqueeze(0)
+        observation = torch.tensor(get_obs(self.env, state)[self.agent_index], dtype=torch.float32).unsqueeze(0).to(self.device)
         distribution = self._get_distribution(observation)
         action_idx = distribution.sample()
         og_log_probs = distribution.log_prob(action_idx)
         action = Action.INDEX_TO_ACTION[action_idx.item()]
         info = {'og_distribution': distribution.probs, 'og_log_probs': og_log_probs}
         return action, info 
+    
 
-    def update_policy(self, observations, actions, returns, old_logprobs, entropy_coeff_current):
+    def compute_gae(self, values, rewards):
+        """
+        observations: 
+        """
+        values = torch.cat((values, torch.zeros(values.shape[0], 1, device=self.device)), dim=1)  # Append a zero to the end of values
+        # print("value shape in compute_gae", values.shape)
+        deltas = rewards + self.config.gae_gamma * values[:, 1:] - values[:, :-1] # next value minus current value 
+        advantages = torch.zeros_like(deltas, device=self.device)
+        gae = 0
+        for t in reversed(range(deltas.shape[1])):
+            gae = deltas[:, t] + self.config.gae_gamma * self.config.gae_lambda * gae
+            advantages[:, t] = gae
+        return advantages
+
+    def update_policy(self, observations, actions, returns, old_logprobs, entropy_coeff_current, debug=False):
         """
         Update the policy using PPO.
 
@@ -146,14 +163,21 @@ class PPOAgent(Agent):
         old_logprobs: torch.tensor of shape (num_episodes * num_steps)
         entropy_coeff_current: float
         """
-
+        observations = observations.to(self.device)
+        actions = actions.to(self.device)
+        returns = returns.to(self.device)
+        old_logprobs = old_logprobs.to(self.device)
+        
         distribution = self._get_distribution(observations)
+        # print(observations.shape)
         value = self._get_value_estimate(observations)
+        # print(value.shape)
 
         # Compute advantages
-        # turn value and returns back to episode shape 
-        value_reshaped = value.view((self.config.num_episodes, self.config.horizon))
-        returns_reshaped = returns.view((self.config.num_episodes, self.config.horizon))
+        # turn value and returns back to episode shape
+        value_reshaped = value.view((-1, self.config.horizon))
+        returns_reshaped = returns.view((-1, self.config.horizon))
+
         advantages = self.compute_gae(value_reshaped, returns_reshaped)
         advantages = advantages.view(-1)
 
@@ -164,20 +188,25 @@ class PPOAgent(Agent):
         policy_loss = torch.min(ratio * advantages, clipped_ratio * advantages).mean()
 
         # value loss
-        value_loss = -self.value_loss_fn(value, returns)
+        assert value.shape == returns.shape # (2000, 1)
+        # value_loss = -self.value_loss_fn(value, returns)
+        value_loss = self.value_loss_fn(value, returns)
     
         # Compute entropy loss
         # Entropy encourages exploration by penalizing deterministic policies
         entropy_loss = distribution.entropy().mean()
         
         total_loss = -policy_loss + (self.config.vf_loss_coeff * value_loss) - (entropy_coeff_current * entropy_loss)
-
+    
+        if debug: print(f"value loss: {value_loss}, policy loss: {policy_loss}, entropy loss: {entropy_loss}")
+        
         # Zero out previous gradients
         self.optimizer.zero_grad()
         
         # Compute and clip gradients
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+        if debug: print("Total Loss", total_loss.item())
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=self.config.max_grad_norm)
         
         # Update network parameters
         self.optimizer.step()
@@ -196,6 +225,7 @@ class PPOTrainer:
         self.agent0 = PPOAgent(self.env, self.config)
         self.agent1 = PPOAgent(self.env, self.config)
         self.agent_pair = AgentPair(self.agent0, self.agent1)
+        self.device = self.config.device
 
     def collect_trajectories(self):
         """
@@ -262,19 +292,6 @@ class PPOTrainer:
         return current_coeff
     
 
-    def compute_gae(self, values, rewards):
-        """
-        observations: 
-        """
-        values = torch.cat((values, torch.zeros(values.shape[0], 1)), dim=1)  # Append a zero to the end of values
-        deltas = rewards + self.config.gamma * values[:, 1:] - values[:, :-1] # next value minus current value 
-        advantages = torch.zeros_like(deltas)
-        gae = 0
-        for t in reversed(range(deltas.shape[1])):
-            gae = deltas[:, t] + self.config.gamma * self.config.lam * gae
-            advantages[:, t] = gae
-        return advantages
-
 
     def train(self):
         """
@@ -311,6 +328,8 @@ class PPOTrainer:
             # Compute shaped rewards
             shaped_rewards = sparse_rewards + dense_rewards * self.config.reward_shaping_factor
 
+            print("Average reward per episode", shaped_rewards.sum(axis=1).mean())
+
             # # get old log probs
             # # infos['og_log_probs'] is shape # (num_episodes, num_steps, num_agents)
             # print(infos.shape)
@@ -321,8 +340,6 @@ class PPOTrainer:
 
             # Compute discounted returns and advantages
             returns = self.get_returns(shaped_rewards)
-
-            
             
             # unroll everything into batch dimension
             state_tensor_p0 = state_tensor_p0.view(-1, *state_tensor_p0.shape[-3:]) # shape (num_episodes * num_steps, num_channels, h/w, h/w)
@@ -334,38 +351,52 @@ class PPOTrainer:
             old_log_probs0 = old_log_probs0.view(-1)
             old_log_probs1 = old_log_probs1.view(-1)
             
-
+            # move to device
+            state_tensor_p0 = state_tensor_p0.to(self.device)
+            state_tensor_p1 = state_tensor_p1.to(self.device)
+            action_tensor0 = action_tensor0.to(self.device)
+            action_tensor1 = action_tensor1.to(self.device)
+            returns = returns.to(self.device)
+            old_log_probs0 = old_log_probs0.to(self.device)
+            old_log_probs1 = old_log_probs1.to(self.device)
 
             # Update policy
-            for epoch in range(self.config.num_epochs):
-                # Compute epoch_iter_step 
-
-                epoch_iter_step = (self.config.num_epochs * iter) + epoch
-                entropy_coeff_current = self.compute_linear_decay_coefficient(epoch_iter_step)
-                
-                # shuffle data
-                indices = torch.randperm(state_tensor_p0.shape[0])
-                state_tensor_p0 = state_tensor_p0[indices]
-                state_tensor_p1 = state_tensor_p1[indices]
-                action_tensor0 = action_tensor0[indices]
-                action_tensor1 = action_tensor1[indices]
-                returns = returns[indices]
-                old_log_probs0 = old_log_probs0[indices]
-                old_log_probs1 = old_log_probs1[indices]
-                for i in range(self.config.num_mini_batches):
-                    # select minibatch
-                    start = ((self.config.horizon * self.config.num_episodes) // self.config.num_mini_batches) * i
-                    end = ((self.config.horizon * self.config.num_episodes) // self.config.num_mini_batches) * (i + 1)
-                    state_tensor_p0_batch = state_tensor_p0[start:end]
-                    state_tensor_p1_batch = state_tensor_p1[start:end]
-                    action_tensor0_batch = action_tensor0[start:end]
-                    action_tensor1_batch = action_tensor1[start:end]
-                    returns_batch = returns[start:end]
-                    old_log_probs0_batch = old_log_probs0[start:end]
-                    old_log_probs1_batch = old_log_probs1[start:end]
-                    # run update
-                    self.agent0.update_policy(state_tensor_p0_batch, action_tensor0_batch, returns_batch, old_logprobs=old_log_probs0_batch, entropy_coeff_current=entropy_coeff_current)
-                    self.agent1.update_policy(state_tensor_p1_batch, action_tensor1_batch, returns_batch, old_logprobs=old_log_probs1_batch, entropy_coeff_current=entropy_coeff_current)
+            # 8 epochs 
+            total_batches = self.config.num_epochs * self.config.num_mini_batches
+            with tqdm(total=total_batches, desc="Training", leave=True) as pbar:
+                for epoch in range(self.config.num_epochs):
+                    # Compute epoch_iter_step 
+                    epoch_iter_step = (self.config.num_epochs * iter) + epoch
+                    entropy_coeff_current = self.compute_linear_decay_coefficient(epoch_iter_step)
+                    
+                    # shuffle data
+                    indices = torch.randperm(state_tensor_p0.shape[0])
+                    state_tensor_p0 = state_tensor_p0[indices]
+                    state_tensor_p1 = state_tensor_p1[indices]
+                    action_tensor0 = action_tensor0[indices]
+                    action_tensor1 = action_tensor1[indices]
+                    returns = returns[indices]
+                    old_log_probs0 = old_log_probs0[indices]
+                    old_log_probs1 = old_log_probs1[indices]
+                    
+                    # 6 minibatches
+                    for i in range(self.config.num_mini_batches):
+                        # select minibatch
+                        start = ((self.config.horizon * self.config.num_episodes) // self.config.num_mini_batches) * i
+                        end = ((self.config.horizon * self.config.num_episodes) // self.config.num_mini_batches) * (i + 1)
+                        state_tensor_p0_batch = state_tensor_p0[start:end]
+                        state_tensor_p1_batch = state_tensor_p1[start:end]
+                        action_tensor0_batch = action_tensor0[start:end]
+                        action_tensor1_batch = action_tensor1[start:end]
+                        returns_batch = returns[start:end]
+                        old_log_probs0_batch = old_log_probs0[start:end]
+                        old_log_probs1_batch = old_log_probs1[start:end]
+                        
+                        # run update 
+                        self.agent0.update_policy(state_tensor_p0_batch, action_tensor0_batch, returns_batch, old_logprobs=old_log_probs0_batch, entropy_coeff_current=entropy_coeff_current, debug=True)
+                        self.agent1.update_policy(state_tensor_p1_batch, action_tensor1_batch, returns_batch, old_logprobs=old_log_probs1_batch, entropy_coeff_current=entropy_coeff_current)
+                        
+                        pbar.update(1)
 
         print("Reward:", rewards)
         return rewards
