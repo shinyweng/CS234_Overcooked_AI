@@ -1,6 +1,6 @@
 class Config:
     """Configuration class for PPOAgent hyperparameters."""
-    def __init__(self, layout="padded_cramped_room", seed_num=0):
+    def __init__(self, layout="cramped_room", seed_num=0):
         # Seeds
         self.seeds = [0, 10, 20, 30,40]
         self.seed = self.seeds[seed_num] 
@@ -13,7 +13,7 @@ class Config:
         self.num_iters = 420
         self.num_epochs = 8
         self.num_mini_batches = 6
-        self.reward_shaping_factor = 0.1 
+        self.reward_shaping_factor = 1.0 
         self.clip_param = 0.05 
         self.num_episodes = 30
         self.max_grad_norm = 0.1 
@@ -40,8 +40,15 @@ class Config:
 
     def _set_layout_hyperparameters(self, layout):
         """Set hyperparameters based on the chosen layout."""
-        if layout == "padded_cramped_room":
+        if layout == "cramped_room":
             self.learning_rate = 1e-3
+            # self.clip_param = 0.132
+            # self.gae_gamma = 0.964 
+            # self.max_grad_norm = 0.247
+            # self.gae_lambda = 0.6
+            # self.learning_rate = 1.63e-4 
+            # self.num_iters = 550
+            # self.vf_loss_coeff=9.95e-3
 
         elif layout == "padded_asymmetric_advantages_tomato":
             self.learning_rate = 1e-4
