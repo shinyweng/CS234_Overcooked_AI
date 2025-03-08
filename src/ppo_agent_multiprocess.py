@@ -499,6 +499,10 @@ def worker_init(config):
 
 if __name__ == "__main__":  
     config = Config()
+    
+    # Set seed for reproducibility
+    torch.manual_seed(config.seed)
+    np.random.seed(config.seed)
 
     with multiprocessing.Pool(5, worker_init, [config]) as pool:
         trainer = PPOTrainer(config, pool)

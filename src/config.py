@@ -1,6 +1,10 @@
 class Config:
     """Configuration class for PPOAgent hyperparameters."""
-    def __init__(self, layout="padded_cramped_room"):
+    def __init__(self, layout="padded_cramped_room", seed_num=0):
+        # Seeds
+        self.seeds = [0, 10, 20, 30,40]
+        self.seed = self.seeds[seed_num] 
+        
         # Shared hyperparameters 
         self.device = 'mps'
         self.normalize_advantage = True
