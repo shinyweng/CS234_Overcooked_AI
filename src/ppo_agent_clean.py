@@ -375,7 +375,7 @@ class PPOTrainer:
             assert dones_batch.shape == (self.config.horizon * self.config.num_episodes, 1)
 
             # Compute and flatten for batch processing - Returns 
-            returns = self.get_returns(sparse_rewards_tensor)
+            returns = self.get_returns(shaped_rewards_tensor)
             returns_batch = returns.view((-1, 1)) 
             assert returns_batch.shape == (self.config.horizon * self.config.num_episodes, 1)
 
