@@ -180,8 +180,9 @@ class PPOAgent(Agent):
         
         for ts in reversed(range(total_time_steps)):
             if ts == total_time_steps - 1:
-                # For the last timestep, use the next_value, which is zero if done
-                delta = returns[ts] + self.config.gae_gamma * 0 * (1 - dones[ts]) - values[ts]
+                # For the last timestep, the bootstrap value should be zero only if the episode terminates
+                bootstrap_value = values[ts] * (1 - dones[ts])
+                delta = returns[ts] + self.config.gae_gamma * bootstrap_value - values[ts]
             else:
                 # Calculate TD error for each timestep 
                 delta = returns[ts] + self.config.gae_gamma * values[ts + 1] * (1 - dones[ts]) - values[ts]
@@ -217,6 +218,9 @@ class PPOAgent(Agent):
         returns = returns.view((-1, self.config.horizon))
         dones = dones.reshape((-1, self.config.horizon))
         advantages = self.compute_GAE(returns, values, dones).view(-1)
+
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         # PPO clip objective: This ensures we don't move too far from the old policy, negated for gradient ascent
         surrogate_loss = -1 * torch.min(
