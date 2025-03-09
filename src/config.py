@@ -21,6 +21,7 @@ class Config:
         self.entropy_coeff_end = 0.1
         self.entropy_coeff_horizon = 3e5
         self.vf_loss_coeff = 0.5
+        self.discount_factor_gamma = 1.0
 
         # Layouts
         self.layouts = ["padded_" + layout for layout in ['cramped_room', 'asymmetric_advantages_tomato', 'coordination_ring', 'forced_coordination', 'counter_circuit']]
