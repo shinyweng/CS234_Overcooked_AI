@@ -20,4 +20,4 @@ def get_observation(env, state):
     # Change layout to be (w, h, c) to (c, w, h)
     obs0 = np.transpose(obs0, (2, 0, 1)) 
     obs1 = np.transpose(obs1, (2, 0, 1))
-    return obs0, obs1 
+    return obs0, obs1

@@ -104,10 +104,11 @@ class PPOAgent(Agent):
     PPO Agent implementation for the Overcooked AI environment. 
     Agents can choose from the following 6 actions: [(0, -1), (0, 1), (1, 0), (-1, 0), (0, 0), 'interact'].
     """
-    def __init__(self, env, config=None, debug_name=None):
+    def __init__(self, env, idx, config=None, debug_name=None):
         super(PPOAgent, self).__init__()
 
         self.debug_name = debug_name
+        self.agent_index = idx
         
         # Initialize configuration
         self.config = config if config else Config()
@@ -267,8 +268,8 @@ class PPOTrainer:
         self.env = OvercookedEnv.from_mdp(mdp, horizon=self.config.horizon)
         
         # Initialize agents
-        self.agent0 = PPOAgent(self.env, self.config)
-        self.agent1 = PPOAgent(self.env, self.config)
+        self.agent0 = PPOAgent(self.env, 0, self.config)
+        self.agent1 = PPOAgent(self.env, 1, self.config)
         self.agent_pair = AgentPair(self.agent0, self.agent1)
 
     def compute_linear_decay_coefficient(self, epoch_iter_step):
@@ -310,6 +311,8 @@ class PPOTrainer:
         
         temp_agent0 = PPOAgent(self.env, self.config, debug_name="TEMP0")
         temp_agent1 = PPOAgent(self.env, self.config, debug_name="TEMP1")
+        temp_agent0.agent_index = 0
+        temp_agent1.agent_index = 1
         temp_agent0.network = temp_agent0.network.cpu()
         temp_agent1.network = temp_agent1.network.to("cpu")
         temp_agent0.device = "cpu" # custom variable
@@ -379,21 +382,27 @@ class PPOTrainer:
                    
             # TODO: Ignore dense_rewards and shaped_rewards for now
             shaped_rewards_tensor = sparse_rewards_tensor + dense_rewards * self.config.reward_shaping_factor
+
+            print(shaped_rewards_tensor.type)
             # shaped_rewards_tensor = sparse_rewards_tensor
 
             #### DUMMY CHECK #### - STAY IN PLACE REWARD
+            step_num = 0
             episode_rewards = [] 
             for episode in action_tensor:
+                if step_num == 0:
+                    print(episode[:10])
+                    step_num += 1
                 horizon_rewards = [] 
                 for time_step in episode:
                     curr_reward = 0 
                     for action_pair in time_step:
-                        if action_pair == (0, 0):
+                        if action_pair.item() == 4: 
                             curr_reward += 1
                     horizon_rewards.append(curr_reward)
                 episode_rewards.append(np.array(horizon_rewards))
 
-            shaped_rewards_tensor = torch.tensor(episode_rewards, device=self.device, dtype=torch.float32)
+            shaped_rewards_tensor = torch.tensor(episode_rewards, dtype=torch.float32)
             #### DUMMY CHECK #### - STAY IN PLACE REWARD
 
             average_reward_per_episode = shaped_rewards_tensor.sum(axis=1).mean()

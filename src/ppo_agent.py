@@ -19,6 +19,12 @@ from overcooked_ai_py.agents.agent import Agent, AgentPair
 MAX_WIDTH = 9
 MAX_HEIGHT = 5
 
+# very jank ass solution from claude 
+from overcooked_ai_py.mdp.overcooked_mdp import Recipe
+
+Recipe.configure({})  # Or with appropriate configuration
+
+
 def get_obs(env, state):
     """
     Get observation from the environment.

@@ -13,10 +13,14 @@ import torch.nn as nn
 # Third-party libraries
 from tqdm import tqdm, trange
 import wandb
+import gymnasium as gym
+
+from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
 
 # Local imports
 from config import Config
@@ -38,62 +42,111 @@ INPUT_CHANNELS = 26
 ACTION_SPACE_SIZE = 6
 
 
-class OvercookedStableBaselinesEnv(OvercookedEnv):
+class OvercookedSBGym(gym.Env):
     """
     Wrapper for the Overcooked environment to be compatible with Stable Baselines3.
     This version supports multi-agent (AgentPair) interactions.
     """
 
-    def __init__(self, mdp, **kwargs):
-        super(OvercookedStableBaselinesEnv, self).__init__(mdp, **kwargs)
+    def __init__(self, base_env):
+        super(OvercookedSBGym, self).__init__()
+
+        self.base_env = base_env
+        self.featurize_fn = get_observation
+
         self.observation_space = self._get_observation_space()
         self.action_space = self._get_action_space()
+
+        self.reset()
 
     def _get_observation_space(self):
         """
         Define the observation space for joint observations (both agents).
         """
-        return spaces.Box(
-            low=0,
-            high=1,
-            shape=(NUM_AGENTS * INPUT_CHANNELS, MAX_WIDTH, MAX_HEIGHT),
-            dtype=np.float32,
-        )
+
+        dummy_mdp = self.base_env.mdp 
+        dummy_state = dummy_mdp.get_standard_start_state()
+        obs_shape = self.featurize_fn(self.base_env, dummy_state)[0].shape
+        high = np.ones(obs_shape, dtype=np.float32) * float("inf")
+        low = np.zeros(obs_shape, dtype=np.float32)
+        return spaces.Box(low, high, dtype=np.float32)
+
+        # return spaces.Box(
+        #     low=0,
+        #     high=1,
+        #     shape=(NUM_AGENTS * INPUT_CHANNELS, MAX_WIDTH, MAX_HEIGHT),
+        #     dtype=np.float32,
+        # )
 
     def _get_action_space(self):
         """
         Define the action space for joint actions (both agents).
         """
-        return spaces.MultiDiscrete([ACTION_SPACE_SIZE] * NUM_AGENTS)
-
-    def reset(self):
-        """
-        Reset the environment and return the initial joint observation.
-        """
-        state = super(OvercookedStableBaselinesEnv, self).reset()
-        obs = get_observation(self, state)
-        joint_obs = np.concatenate([obs[0], obs[1]], axis=0)  # Concatenate observations
-        return joint_obs
-
+        return spaces.Discrete((ACTION_SPACE_SIZE))
     def step(self, action):
         """
         Execute one time step within the environment.
         Returns joint observations, rewards, and done flags.
         """
         # Convert joint action to individual actions
-        action_p0 = Action.INDEX_TO_ACTION[action[0]]
-        action_p1 = Action.INDEX_TO_ACTION[action[1]]
-        joint_action = (action_p0, action_p1)
+        agent0_action, agent1_action = [
+            Action.INDEX_TO_ACTION[a] for a in action
+        ]
+
+        if self.agent_idx == 0:
+            joint_action = (agent0_action, agent1_action)
+        else:
+            joint_action = (agent1_action, agent0_action)
 
         # Step the environment
-        state, reward, done, info = super(OvercookedStableBaselinesEnv, self).step(joint_action)
+        next_state, reward, done, env_info = self.base_env.step(joint_action)
+        obs_agent0, obs_agent1 = self.featurize_fn(self.base_env, next_state)
 
-        # Get joint observations
-        obs = get_observation(self, state)
-        joint_obs = np.concatenate([obs[0], obs[1]], axis=0)
+        if self.agent_idx == 0:
+            both_agents_ob = (obs_agent0, obs_agent1)
+        else:
+            both_agents_ob = (obs_agent1, obs_agent0)
 
-        # Return joint observations, rewards, and done flags
-        return joint_obs, reward, done, info
+        env_info["policy_agent_idx"] = self.agent_idx
+
+        if "episode" in env_info.keys():
+            env_info["episode"]["policy_agent_idx"] = self.agent_idx
+
+        obs = {
+            "both_agent_obs": both_agents_ob,
+            "overcooked_state": next_state,
+            "other_agent_env_idx": 1 - self.agent_idx,
+        }
+        return obs, reward, done, env_info
+    
+    def reset(self):
+        """
+        When training on individual maps, we want to randomize which agent is assigned to which
+        starting location, in order to make sure that the agents are trained to be able to
+        complete the task starting at either of the hardcoded positions.
+
+        NOTE: a nicer way to do this would be to just randomize starting positions, and not
+        have to deal with randomizing indices.
+        """
+        self.base_env.reset()
+        self.mdp = self.base_env.mdp
+        self.agent_idx = np.random.choice([0, 1])
+        ob_p0, ob_p1 = self.featurize_fn(self.base_env, self.base_env.state)
+
+        if self.agent_idx == 0:
+            both_agents_ob = np.concatenate([ob_p0, ob_p1], axis=0).astype(np.float32)
+            # both_agents_ob = (ob_p0, ob_p1)
+        else:
+            both_agents_ob = np.concatenate([ob_p1, ob_p0], axis=0).astype(np.float32)
+            # both_agents_ob = (ob_p1, ob_p0)
+            
+        # return {
+        #     "both_agent_obs": both_agents_ob,
+        #     "overcooked_state": self.base_env.state,
+        #     "other_agent_env_idx": 1 - self.agent_idx,
+        # }
+
+        return both_agents_ob, {"overcooked_state": self.base_env.state, "other_agent_env_idx": 1 - self.agent_idx}
 
 
 class CustomNetwork(BaseFeaturesExtractor):
@@ -134,10 +187,11 @@ class PPOTrainer:
 
         # Initialize environment
         mdp = OvercookedGridworld.from_layout_name(layout_name=self.config.layout)
-        self.env = OvercookedStableBaselinesEnv(mdp, horizon=self.config.horizon)
+        env = OvercookedEnv.from_mdp(mdp)
+        self.env = OvercookedSBGym(env)
 
         # Create a vectorized environment
-        self.vec_env = make_vec_env(lambda: self.env, n_envs=multiprocessing.cpu_count(), vec_env_cls=SubprocVecEnv)
+        self.vec_env = make_vec_env(lambda: self.env, n_envs=multiprocessing.cpu_count(), vec_env_cls=SubprocVecEnv, ) #vec_env_kwargs=dict(start_method="fork")
 
         # Initialize PPO agent with a custom network
         policy_kwargs = dict(
@@ -146,6 +200,7 @@ class PPOTrainer:
         )
         self.agent = PPO(
             "MultiInputPolicy",
+            # self.env,
             self.vec_env,
             verbose=1,
             device=self.device,
