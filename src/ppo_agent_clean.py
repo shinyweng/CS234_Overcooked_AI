@@ -30,7 +30,6 @@ from ppo_helper import get_observation
 # Constants 
 MAX_WIDTH = 5 #9
 MAX_HEIGHT = 4 #5
-CHANNELS = 26
 NUM_AGENTS = 2
 INPUT_CHANNELS = 26
 ACTION_SPACE_SIZE = 6
@@ -105,8 +104,10 @@ class PPOAgent(Agent):
     PPO Agent implementation for the Overcooked AI environment. 
     Agents can choose from the following 6 actions: [(0, -1), (0, 1), (1, 0), (-1, 0), (0, 0), 'interact'].
     """
-    def __init__(self, env, config=None):
+    def __init__(self, env, config=None, debug_name=None):
         super(PPOAgent, self).__init__()
+
+        self.debug_name = debug_name
         
         # Initialize configuration
         self.config = config if config else Config()
@@ -151,7 +152,7 @@ class PPOAgent(Agent):
         """
         Get action from the current policy.
         """
-        observation = torch.tensor(get_observation(self.env, state)[self.agent_index], dtype=torch.float32).unsqueeze(0) 
+        observation = torch.tensor(get_observation(self.env, state)[self.agent_index], dtype=torch.float32, device=self.network.device).unsqueeze(0) 
         assert observation.shape == (1, INPUT_CHANNELS, MAX_WIDTH, MAX_HEIGHT)
         distribution = self._get_distribution(observation)
         action_idx = distribution.sample()
@@ -195,7 +196,7 @@ class PPOAgent(Agent):
         
         return advantages
     
-    def update_policy(self, observations, actions, returns, old_action_log_prob, dones, rewards=None, entropy_coeff_current=None, debug=False):
+    def update_policy(self, observations, actions, advantages, returns, old_action_log_prob, entropy_coeff_current=None, debug=False):
         """
         Updates the policy using Proximal Point Optimization (PPO). 
         Uses the PPO-Clip objective. 
@@ -213,11 +214,14 @@ class PPOAgent(Agent):
         # Compute the ratio of new and old log probabilities 
         log_prob_ratio = torch.exp(curr_action_log_prob - old_action_log_prob)
 
-        # Compute advantages (reshape value and returns to have dim self.config.horizon), (2000, 1) --> (5, 400)
-        values = self._get_value_estimate(observations).view((-1, self.config.horizon))
-        returns = returns.view((-1, self.config.horizon))
-        dones = dones.reshape((-1, self.config.horizon))
-        advantages = self.compute_GAE(returns, values, dones).view(-1)
+        values = self._get_value_estimate(observations)
+
+
+        # DOING ADVANTAGE CALCULATION OUTSIDE
+        # # Compute advantages (reshape value and returns to have dim self.config.horizon), (2000, 1) --> (5, 400)
+        # returns = returns.view((-1, self.config.horizon))
+        # dones = dones.reshape((-1, self.config.horizon))
+        # advantages = self.compute_GAE(returns, values, dones).view(-1)
 
         # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -295,7 +299,7 @@ class PPOTrainer:
                 returns[t] = cumulative_return
             all_returns.append(returns)
         
-        return torch.Tensor(np.stack(all_returns))
+        return torch.tensor(np.stack(all_returns))
 
     def collect_trajectories(self):
         """
@@ -303,7 +307,24 @@ class PPOTrainer:
         Returns NN-compatible tensors for state, action, reward, infos, and dones. 
         """
         # Call `get_rollouts` function to obtain trajectories for number of episodes and extract information
-        trajectories = self.env.get_rollouts(self.agent_pair, self.config.num_episodes, info=True, display_phi=True)
+        
+        temp_agent0 = PPOAgent(self.env, self.config, debug_name="TEMP0")
+        temp_agent1 = PPOAgent(self.env, self.config, debug_name="TEMP1")
+        temp_agent0.network = temp_agent0.network.cpu()
+        temp_agent1.network = temp_agent1.network.to("cpu")
+        temp_agent0.device = "cpu" # custom variable
+        temp_agent1.device = "cpu" # custom variable
+        temp_agent0.network.device = "cpu" # custom variable
+        temp_agent1.network.device = "cpu" # custom variable
+        # copy weights into temp agent
+        state_dict0 = {k: v.cpu() for k, v in self.agent0.network.state_dict().items()}
+        state_dict1 = {k: v.cpu() for k, v in self.agent1.network.state_dict().items()}
+        temp_agent0.network.load_state_dict(state_dict0)
+        temp_agent1.network.load_state_dict(state_dict1)
+        temp_agent_pair = AgentPair(temp_agent0, temp_agent1)
+        trajectories = self.env.get_rollouts(temp_agent_pair, self.config.num_episodes, info=True, display_phi=True)
+        
+        # trajectories = self.env.get_rollouts(self.agent_pair, self.config.num_episodes, info=True, display_phi=True)
         states = trajectories["ep_states"] # Representation of the OvercookedGridWorld, with players and objects mapping
         actions = trajectories["ep_actions"] # Tuples, representing action (p0_action, p1_action)
         rewards = trajectories["ep_rewards"].astype(np.float32) # Total rewards obtain for each action
@@ -337,11 +358,11 @@ class PPOTrainer:
             if debug and iter % 10 == 0: print("\n===========Training for Iteration {iter} ===========\n") 
 
             # Obtain a set of trajectories by running current policy in the environment 
-            self.agent0.network.to('cpu') # Move to CPU 
-            self.agent1.network.to('cpu')
+            # self.agent0.network.to('cpu') # Move to CPU 
+            # self.agent1.network.to('cpu')
             state_p0_tensor, state_p1_tensor, action_tensor, sparse_rewards_tensor, infos, dones = self.collect_trajectories()
-            self.agent0.network.to(self.device)
-            self.agent1.network.to(self.device)
+            # self.agent0.network.to(self.device)
+            # self.agent1.network.to(self.device)
             
             # Extract old log probabilities and rewards
             dense_rewards, old_log_probs_p0, old_log_probs_p1 = [], [], []
@@ -360,9 +381,42 @@ class PPOTrainer:
             shaped_rewards_tensor = sparse_rewards_tensor + dense_rewards * self.config.reward_shaping_factor
             # shaped_rewards_tensor = sparse_rewards_tensor
 
+            #### DUMMY CHECK #### - STAY IN PLACE REWARD
+            episode_rewards = [] 
+            for episode in action_tensor:
+                horizon_rewards = [] 
+                for time_step in episode:
+                    curr_reward = 0 
+                    for action_pair in time_step:
+                        if action_pair == (0, 0):
+                            curr_reward += 1
+                    horizon_rewards.append(curr_reward)
+                episode_rewards.append(np.array(horizon_rewards))
+
+            shaped_rewards_tensor = torch.tensor(episode_rewards, device=self.device, dtype=torch.float32)
+            #### DUMMY CHECK #### - STAY IN PLACE REWARD
+
             average_reward_per_episode = shaped_rewards_tensor.sum(axis=1).mean()
-            print("\n=========== Average Reward per Episode: ===========\n", average_reward_per_episode)
+            print("\n=========== Average Reward per Episode: ===========\n", average_reward_per_episode.item())
             wandb.log({"Average Reward": average_reward_per_episode, "Iteration": iter})
+            
+            # Move to device 
+            state_p0_tensor = state_p0_tensor.to(self.device)
+            state_p1_tensor = state_p1_tensor.to(self.device)
+
+            # Compute returns and value estimates 
+            returns = self.get_returns(shaped_rewards_tensor)
+            values_p0 = self.agent0._get_value_estimate(state_p0_tensor.view(-1, INPUT_CHANNELS, MAX_WIDTH, MAX_HEIGHT))
+            values_p1 = self.agent1._get_value_estimate(state_p1_tensor.view(-1, INPUT_CHANNELS, MAX_WIDTH, MAX_HEIGHT))
+
+            # Convert dones to tensor and move to device
+            dones = torch.tensor(dones.astype(np.int64)).to(self.device)
+            # move returns to device
+            returns = returns.to(self.device)
+
+            # Compute advantages 
+            advantages_p0 = self.agent0.compute_GAE(returns, values_p0, dones) # TODO for cleanup, can move the "get_value_estimate" to the compute_GAE function
+            advantages_p1 = self.agent1.compute_GAE(returns, values_p1, dones)
 
             # Flatten for batch processing - State 
             state_p0_batch = state_p0_tensor.view(-1, *state_p0_tensor.shape[-3:])
@@ -374,26 +428,40 @@ class PPOTrainer:
             action_p0_batch = action_tensor_joint[:, 0] 
             action_p1_batch = action_tensor_joint[:, 1] 
 
-            # Flatten for batch processing - Dones 
-            dones_batch = torch.Tensor(dones.astype(np.bool_)).view(-1, 1)
-            assert dones_batch.shape == (self.config.horizon * self.config.num_episodes, 1)
-
-            # Compute and flatten for batch processing - Returns 
-            returns = self.get_returns(shaped_rewards_tensor)
+            # Flatten for batch processing 
             returns_batch = returns.view((-1, 1)) 
             assert returns_batch.shape == (self.config.horizon * self.config.num_episodes, 1)
 
+            # Flatten for batch processing - Dones 
+            dones_batch = dones.view(-1, 1)
+            assert dones_batch.shape == (self.config.horizon * self.config.num_episodes, 1)
+
+            # Flatten for batch processing - Advantages 
+            advantages_p0_batch = advantages_p0.view((-1, 1))
+            advantages_p1_batch = advantages_p1.view((-1, 1))
+            assert advantages_p0_batch.shape == advantages_p1_batch.shape == (self.config.horizon * self.config.num_episodes, 1)
+
             # Reshape old log probabilities 
-            old_log_probs_p0_batch = torch.Tensor(old_log_probs_p0).view(-1, 1)
-            old_log_probs_p1_batch = torch.Tensor(old_log_probs_p1).view(-1, 1)
+            old_log_probs_p0_batch = torch.tensor(old_log_probs_p0).view(-1, 1)
+            old_log_probs_p1_batch = torch.tensor(old_log_probs_p1).view(-1, 1)
             assert old_log_probs_p0_batch.shape == old_log_probs_p1_batch.shape == (self.config.horizon * self.config.num_episodes, 1)
 
+            # detach and remove from gradient tracking
+            action_p0_batch = action_p0_batch.detach().requires_grad_(False)
+            action_p1_batch = action_p1_batch.detach().requires_grad_(False)
+            returns_batch = returns_batch.detach().requires_grad_(False)
+            advantages_p0_batch = advantages_p0_batch.detach().requires_grad_(False)
+            advantages_p1_batch = advantages_p1_batch.detach().requires_grad_(False)
+            old_log_probs_p0_batch = old_log_probs_p0_batch.detach().requires_grad_(False)
+            old_log_probs_p1_batch = old_log_probs_p1_batch.detach().requires_grad_(False)
+            dones_batch = dones_batch.detach().requires_grad_(False)
+            
             # Move to device 
-            state_p0_batch = state_p0_batch.to(self.device)
-            state_p1_batch = state_p1_batch.to(self.device)
             action_p0_batch = action_p0_batch.to(self.device)
             action_p1_batch = action_p1_batch.to(self.device)
             returns_batch = returns_batch.to(self.device)
+            advantages_p0_batch = advantages_p0_batch.to(self.device)
+            advantages_p1_batch = advantages_p1_batch.to(self.device)
             old_log_probs_p0_batch = old_log_probs_p0_batch.to(self.device)
             old_log_probs_p1_batch = old_log_probs_p1_batch.to(self.device)
             dones_batch = dones_batch.to(self.device)
@@ -415,6 +483,8 @@ class PPOTrainer:
                     curr_action_tensor_p0 = action_p0_batch[shuffled_indices]
                     curr_action_tensor_p1 = action_p1_batch[shuffled_indices]
                     curr_returns = returns_batch[shuffled_indices]
+                    curr_advantages_p0 = advantages_p0_batch[shuffled_indices]
+                    curr_advantages_p1 = advantages_p1_batch[shuffled_indices]
                     curr_old_log_probs_p0 = old_log_probs_p0_batch[shuffled_indices]
                     curr_old_log_probs_p1 = old_log_probs_p1_batch[shuffled_indices]
                     curr_dones = dones_batch[shuffled_indices]
@@ -428,13 +498,15 @@ class PPOTrainer:
                         action_tensor_p0_minibatch = curr_action_tensor_p0[start:end]
                         action_tensor_p1_minibatch = curr_action_tensor_p1[start:end]
                         returns_minibatch = curr_returns[start:end]
+                        advantages_p0_minibatch = curr_advantages_p0[start:end]
+                        advantages_p1_minibatch = curr_advantages_p1[start:end]
                         old_log_probs_p0_minibatch = curr_old_log_probs_p0[start:end]
                         old_log_probs_p1_minibatch = curr_old_log_probs_p1[start:end]
                         dones_minibatch = curr_dones[start:end]
                         
                         # Update policy 
-                        self.agent0.update_policy(state_tensor_p0_minibatch, action_tensor_p0_minibatch, returns_minibatch, old_log_probs_p0_minibatch, dones_minibatch, entropy_coeff_current=entropy_coeff_current, debug=True)
-                        self.agent1.update_policy(state_tensor_p1_minibatch, action_tensor_p1_minibatch, returns_minibatch, old_log_probs_p1_minibatch, dones_minibatch, entropy_coeff_current=entropy_coeff_current, debug=True)
+                        self.agent0.update_policy(state_tensor_p0_minibatch, action_tensor_p0_minibatch, advantages_p0_minibatch, returns_minibatch, old_log_probs_p0_minibatch, entropy_coeff_current=entropy_coeff_current, debug=True)
+                        self.agent1.update_policy(state_tensor_p1_minibatch, action_tensor_p1_minibatch, advantages_p1_minibatch, returns_minibatch, old_log_probs_p1_minibatch, entropy_coeff_current=entropy_coeff_current, debug=False)
                         
                         # Update progress bar
                         progress_bar.update(1)

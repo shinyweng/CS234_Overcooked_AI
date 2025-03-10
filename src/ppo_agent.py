@@ -6,7 +6,7 @@ import torch.nn as nn
 import numpy as np
 from config import Config
 from tqdm import tqdm, trange
-import wandb
+# import wandb
 
 
 from overcooked_ai_py.mdp.actions import Action
@@ -58,7 +58,8 @@ class PPONetwork(nn.Module):
             nn.Conv2d(in_channels=25, out_channels=25, kernel_size=3, padding="same"),
             nn.LeakyReLU(),
             nn.Flatten(),
-            nn.Linear(525, 32), 
+            nn.Linear(150, 32), 
+            # nn.Linear(525, 32), 
             nn.LeakyReLU(),
             nn.Linear(32, 32),
             nn.LeakyReLU(),
@@ -131,7 +132,7 @@ class PPOAgent(Agent):
         """
         Get action from the current policy.
         """
-        observation = torch.tensor(get_obs(self.env, state)[self.agent_index], dtype=torch.float32).unsqueeze(0)#.to(self.device)
+        observation = torch.tensor(get_obs(self.env, state)[self.agent_index], dtype=torch.float32).unsqueeze(0).to(self.device)
         distribution = self._get_distribution(observation)
         action_idx = distribution.sample()
         og_log_probs = distribution.log_prob(action_idx)
@@ -223,7 +224,7 @@ class PPOTrainer:
         
         
         # Initialize WandB
-        wandb.init(project="overcooked-ppo", config=self.config.__dict__)
+        # wandb.init(project="overcooked-ppo", config=self.config.__dict__)
         
         # Initialize environment
         mdp = OvercookedGridworld.from_layout_name(layout_name=self.config.layout)   
@@ -260,6 +261,12 @@ class PPOTrainer:
         action_tensor = torch.tensor([[[Action.ACTION_TO_INDEX[act] for act in agent_acts] for agent_acts in episode] for episode in actions], dtype=torch.long) # shape (num_episodes, num_steps, num_agents)
         # print("rewards", rewards)
         reward_tensor = torch.tensor(rewards, dtype=torch.float32)
+        
+        # Move tensors to device
+        state_tensor_p0 = state_tensor_p0.to(self.device)
+        state_tensor_p1 = state_tensor_p1.to(self.device)
+        action_tensor = action_tensor.to(self.device)
+        reward_tensor = reward_tensor.to(self.device)
 
         return state_tensor_p0, state_tensor_p1, action_tensor, reward_tensor, infos
     
@@ -313,11 +320,11 @@ class PPOTrainer:
                 print(f"iter {iter}")
                 
             #### Collect all data ####
-            self.agent0.network.to('cpu')
-            self.agent1.network.to('cpu')
+            # self.agent0.network.to('cpu')
+            # self.agent1.network.to('cpu')
             state_tensor_p0, state_tensor_p1, action_tensor, sparse_rewards, infos = self.collect_trajectories()
-            self.agent0.network.to(self.device)
-            self.agent1.network.to(self.device)
+            # self.agent0.network.to(self.device)
+            # self.agent1.network.to(self.device)
 
             # Compute dense rewards
             # print("Collecting Rewards")
@@ -336,14 +343,33 @@ class PPOTrainer:
             old_log_probs0 = torch.tensor(old_log_probs0, dtype=torch.float32)
             old_log_probs1 = torch.tensor(old_log_probs1, dtype=torch.float32)
 
+            # Move to device
+            dense_rewards = dense_rewards.to(self.device)
+            old_log_probs0 = old_log_probs0.to(self.device)
+            old_log_probs1 = old_log_probs1.to(self.device)
 
             # Compute shaped rewards
             shaped_rewards = sparse_rewards + dense_rewards * self.config.reward_shaping_factor
 
+            #### DUMMY CHECK #### - STAY IN PLACE REWARD
+            episode_rewards = [] 
+            for episode in action_tensor:
+                horizon_rewards = [] 
+                for time_step in episode:
+                    curr_reward = 0 
+                    for action_pair in time_step:
+                        if action_pair == (0, 0):
+                            curr_reward += 1
+                    horizon_rewards.append(curr_reward)
+                episode_rewards.append(np.array(horizon_rewards))
+
+            shaped_rewards = torch.tensor(episode_rewards, device=self.device)
+            #### DUMMY CHECK #### - STAY IN PLACE REWARD
+
             avg_reward = shaped_rewards.sum(axis=1).mean()
             print("Average reward per episode", avg_reward)
 
-            wandb.log({"Average Reward": avg_reward, "Iteration": iter})
+            # wandb.log({"Average Reward": avg_reward, "Iteration": iter})
 
             # # get old log probs
             # # infos['og_log_probs'] is shape # (num_episodes, num_steps, num_agents)
@@ -413,12 +439,13 @@ class PPOTrainer:
                         
                         pbar.update(1)
 
-        wandb.finish()
+        # wandb.finish()
         print("Reward:", rewards)
         return rewards
     
 if __name__ == "__main__":  
     layout_mapping = {
+            0: 'cramped_room',
             1: 'padded_cramped_room', 
             2: 'padded_asymmetric_advantages_tomato',
             3: 'padded_coordination_ring', 
@@ -430,7 +457,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--layout", 
         type=int, 
-        default=1, 
+        default=0, 
         choices=["padded_cramped_room", "padded_asymmetric_advantages_tomato", "padded_coordination_ring", "padded_forced_coordination", "padded_counter_circuit"],
         help="The layout to use for training."
     )
