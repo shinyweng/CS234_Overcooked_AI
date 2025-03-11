@@ -21,6 +21,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.callbacks import BaseCallback
 
 # Local imports
 from config import Config
@@ -62,7 +63,12 @@ class OvercookedSBGym(gym.Env):
         self.observation_space = self._get_observation_space()
         self.action_space = self._get_action_space()
 
+        self.reward_shaping_scaler = 1.0
+
         self.reset()
+
+    def set_reward_shaping_scaler(self, reward_shaping_scaler):
+        self.reward_shaping_scaler = reward_shaping_scaler
 
     def _get_observation_space(self):
         """
@@ -108,7 +114,7 @@ class OvercookedSBGym(gym.Env):
         if reward > 0:
             print(reward, joint_action, next_state)
 
-        shaped_reward = reward + env_info["shaped_r_by_agent"][0]
+        shaped_reward = reward + self.reward_shaping_scaler * env_info["shaped_r_by_agent"][0]
 
         # shaped_reward = reward + env_info['phi_s_prime'] - env_info['phi_s']
         obs_agent0, obs_agent1 = self.featurize_fn(self.base_env, next_state)
@@ -189,6 +195,30 @@ class CustomNetwork(BaseFeaturesExtractor):
         return self.network(observations)
 
 
+class CustomCallback(BaseCallback):
+    def __init__(self, initial_entropy_coeff, final_entropy_coeff, entropy_horizon, reward_shaping_horizon, verbose: int = 0):
+        super(CustomCallback, self).__init__(verbose)
+        self.initial_entropy_coeff = initial_entropy_coeff
+        self.final_entropy_coeff = final_entropy_coeff
+        self.entropy_horizon = entropy_horizon
+        self.reward_shaping_horizon = reward_shaping_horizon
+    
+    def _on_step(self) -> bool:
+        timestep = self.num_timesteps
+        entropy_fraction = min(1, timestep / self.entropy_horizon)
+        entropy_coeff = self.initial_entropy_coeff + entropy_fraction * (self.final_entropy_coeff - self.initial_entropy_coeff)
+        self.model.ent_coef = entropy_coeff
+
+        reward_shaping_fraction = min(1, timestep / self.reward_shaping_horizon)
+        reward_shaping_coeff = 1 - reward_shaping_fraction 
+
+        self.training_env.env_method("set_reward_shaping_scaler", reward_shaping_coeff)
+
+        if timestep % 12000 == 0:
+            self.logger.log(f"Timestep: {timestep}, Entropy Coefficient: {entropy_coeff}, Reward Shaping Coefficient: {reward_shaping_coeff}")
+
+        return True
+
 class PPOTrainer:
     """
     Handles the PPO training process for multi-agent Overcooked using Stable Baselines3.
@@ -207,6 +237,8 @@ class PPOTrainer:
 
         # Create a vectorized environment
         self.vec_env = make_vec_env(OvercookedSBGym, n_envs=self.config.num_episodes, vec_env_cls=SubprocVecEnv) #, vec_env_kwargs=dict(start_method="fork"))
+
+        self.custom_callback = CustomCallback(self.config.entropy_coeff_start, self.config.entropy_coeff_end, self.config.entropy_coeff_horizon, self.config.reward_shaping_horizon)
 
         # Initialize PPO agent with a custom network
         policy_kwargs = dict(
@@ -229,7 +261,7 @@ class PPOTrainer:
             gamma=self.config.gae_gamma,
             gae_lambda=self.config.gae_lambda,
             clip_range=self.config.clip_param,
-            ent_coef=self.config.entropy_coeff_end, # changed from start, tmux 0 on start, tmux 1 on end
+            ent_coef=self.config.entropy_coeff_start,
             max_grad_norm=self.config.max_grad_norm,
             vf_coef=self.config.vf_loss_coeff,
         )
@@ -247,7 +279,7 @@ class PPOTrainer:
             print(key, param.shape)
 
         self.agent.learn(total_timesteps=self.config.num_iters*self.config.horizon * self.config.num_episodes, reset_num_timesteps=False, progress_bar=True,
-                            log_interval=1)
+                            log_interval=1, callback=self.custom_callback)
 
         # Evaluate the agent
         # average_reward_per_episode = self.evaluate()

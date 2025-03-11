@@ -14,6 +14,7 @@ class Config:
         self.num_epochs = 8
         self.num_mini_batches = 6
         self.reward_shaping_factor = 1.0 
+        self.reward_shaping_horizon = 2.5e6
         self.clip_param = 0.05 
         self.num_episodes =  30
         self.max_grad_norm = 0.1 
