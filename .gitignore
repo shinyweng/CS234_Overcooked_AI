@@ -2,3 +2,5 @@
 *.py[cod]
 
 wandb/*
+
+.DS_store
