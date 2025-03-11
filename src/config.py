@@ -6,11 +6,11 @@ class Config:
         self.seed = self.seeds[seed_num] 
         
         # Shared hyperparameters 
-        self.device = 'mps'
+        self.device = 'cuda'
         self.normalize_advantage = True
         self.update_freq = 5
         self.horizon = 400
-        self.num_iters = 420
+        self.num_iters = 840
         self.num_epochs = 8
         self.num_mini_batches = 6
         self.reward_shaping_factor = 1.0 
@@ -21,7 +21,6 @@ class Config:
         self.entropy_coeff_end = 0.1
         self.entropy_coeff_horizon = 3e5
         self.vf_loss_coeff = 0.5
-        self.discount_factor_gamma = 1.0
 
         # Layouts
         self.layouts = ["padded_" + layout for layout in ['cramped_room', 'asymmetric_advantages_tomato', 'coordination_ring', 'forced_coordination', 'counter_circuit']]

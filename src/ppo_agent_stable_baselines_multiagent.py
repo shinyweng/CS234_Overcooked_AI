@@ -87,7 +87,7 @@ class OvercookedSBGym(gym.Env):
         """
         Define the action space for joint actions (both agents).
         """
-        return spaces.MultiDiscrete([ACTION_SPACE_SIZE, ACTION_SPACE_SIZE])
+        return spaces.Discrete(ACTION_SPACE_SIZE)
     
     def step(self, action):
         """
@@ -97,9 +97,9 @@ class OvercookedSBGym(gym.Env):
         Assuming action is a MultiDiscrete tuple of (player0_action, player1_action).
         """
         # Convert joint action to individual actions
-        agent0_action, agent1_action = [
-            Action.INDEX_TO_ACTION[a] for a in action
-        ]
+        agent0_action = Action.INDEX_TO_ACTION[action]
+        agent1_action = Action.INDEX_TO_ACTION[4]
+
         
         joint_action = (agent0_action, agent1_action)
 
@@ -108,7 +108,7 @@ class OvercookedSBGym(gym.Env):
         if reward > 0:
             print(reward, joint_action, next_state)
 
-        shaped_reward = reward + env_info["shaped_r_by_agent"][0] + env_info["shaped_r_by_agent"][1]
+        shaped_reward = reward + env_info["shaped_r_by_agent"][0]
 
         # shaped_reward = reward + env_info['phi_s_prime'] - env_info['phi_s']
         obs_agent0, obs_agent1 = self.featurize_fn(self.base_env, next_state)
@@ -159,7 +159,6 @@ class OvercookedSBGym(gym.Env):
         # for now, just use agent0_obs for everyting
         
         infos = {}
-        print("running reset")
         return ob_p0, infos #, {"overcooked_state": self.base_env.state, "other_agent_env_idx": 1 - self.agent_idx}
 
 
@@ -178,11 +177,11 @@ class CustomNetwork(BaseFeaturesExtractor):
             nn.Conv2d(in_channels=25, out_channels=25, kernel_size=3, padding="same"),
             nn.LeakyReLU(),
             nn.Flatten(),
-            nn.Linear(150, 25),
+            nn.Linear(150, 32),
             nn.LeakyReLU(),
-            nn.Linear(25, 25),
+            nn.Linear(32, 32),
             nn.LeakyReLU(),
-            nn.Linear(25, features_dim),
+            nn.Linear(32, features_dim),
             nn.LeakyReLU(),
         )
 
@@ -212,7 +211,9 @@ class PPOTrainer:
         # Initialize PPO agent with a custom network
         policy_kwargs = dict(
             features_extractor_class=CustomNetwork,
-            features_extractor_kwargs=dict(features_dim=25),
+            features_extractor_kwargs=dict(features_dim=32),
+            net_arch=dict(pi=[], vf=[]),
+            share_features_extractor=True,
         )
         self.agent = PPO(
             "CnnPolicy",
@@ -228,7 +229,7 @@ class PPOTrainer:
             gamma=self.config.gae_gamma,
             gae_lambda=self.config.gae_lambda,
             clip_range=self.config.clip_param,
-            ent_coef=self.config.entropy_coeff_start,
+            ent_coef=self.config.entropy_coeff_end, # changed from start, tmux 0 on start, tmux 1 on end
             max_grad_norm=self.config.max_grad_norm,
             vf_coef=self.config.vf_loss_coeff,
         )
@@ -237,20 +238,21 @@ class PPOTrainer:
         """
         Performs training.
         """
-        # Training loop, up to 420 iterations
-        for iter in range(self.config.num_iters):
-            # Debugging print statement
-            if debug and iter % 10 == 0:
-                print(f"\n=========== Training for Iteration {iter} ===========\n")
 
-            # Train the agent
-            print("before learn")
-            self.agent.learn(total_timesteps=self.config.horizon * self.config.num_episodes, reset_num_timesteps=False, progress_bar=True)
+        print(self.agent.policy)
 
-            # Evaluate the agent
-            # average_reward_per_episode = self.evaluate()
-            # print(f"\n=========== Average Reward per Episode: {average_reward_per_episode} ===========\n")
-            # wandb.log({"Average Reward": average_reward_per_episode, "Iteration": iter})
+        print("====")
+
+        for key, param in self.agent.policy.named_parameters():
+            print(key, param.shape)
+
+        self.agent.learn(total_timesteps=self.config.num_iters*self.config.horizon * self.config.num_episodes, reset_num_timesteps=False, progress_bar=True,
+                            log_interval=1)
+
+        # Evaluate the agent
+        # average_reward_per_episode = self.evaluate()
+        # print(f"\n=========== Average Reward per Episode: {average_reward_per_episode} ===========\n")
+        # wandb.log({"Average Reward": average_reward_per_episode, "Iteration": iter})
 
         # wandb.finish()
         print("Training complete.")
