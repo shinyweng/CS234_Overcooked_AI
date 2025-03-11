@@ -105,7 +105,12 @@ class OvercookedSBGym(gym.Env):
 
         # Step the environment
         next_state, reward, done, env_info = self.base_env.step(joint_action, display_phi=True)
-        shaped_reward = reward + env_info['phi_s_prime'] - env_info['phi_s']
+        if reward > 0:
+            print(reward, joint_action, next_state)
+
+        shaped_reward = reward + env_info["shaped_r_by_agent"][0] + env_info["shaped_r_by_agent"][1]
+
+        # shaped_reward = reward + env_info['phi_s_prime'] - env_info['phi_s']
         obs_agent0, obs_agent1 = self.featurize_fn(self.base_env, next_state)
 
         # both_agents_ob = (obs_agent0, obs_agent1)
@@ -154,6 +159,7 @@ class OvercookedSBGym(gym.Env):
         # for now, just use agent0_obs for everyting
         
         infos = {}
+        print("running reset")
         return ob_p0, infos #, {"overcooked_state": self.base_env.state, "other_agent_env_idx": 1 - self.agent_idx}
 
 
