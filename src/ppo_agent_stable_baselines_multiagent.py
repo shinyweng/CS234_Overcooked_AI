@@ -14,13 +14,13 @@ import torch.nn as nn
 from tqdm import tqdm, trange
 import wandb
 import gymnasium as gym
-
 from gymnasium import spaces
+
+# Stable baseline imports
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-
 
 # Local imports
 from config import Config
@@ -48,10 +48,15 @@ class OvercookedSBGym(gym.Env):
     This version supports multi-agent (AgentPair) interactions.
     """
 
-    def __init__(self, base_env):
+    def __init__(self):
         super(OvercookedSBGym, self).__init__()
 
-        self.base_env = base_env
+        self.config = Config()
+
+        mdp = OvercookedGridworld.from_layout_name(layout_name=self.config.layout)
+        env = OvercookedEnv.from_mdp(mdp, horizon=self.config.horizon)
+
+        self.base_env = env
         self.featurize_fn = get_observation
 
         self.observation_space = self._get_observation_space()
@@ -82,44 +87,44 @@ class OvercookedSBGym(gym.Env):
         """
         Define the action space for joint actions (both agents).
         """
-        return spaces.Discrete((ACTION_SPACE_SIZE))
+        return spaces.MultiDiscrete([ACTION_SPACE_SIZE, ACTION_SPACE_SIZE])
+    
     def step(self, action):
         """
         Execute one time step within the environment.
         Returns joint observations, rewards, and done flags.
+
+        Assuming action is a MultiDiscrete tuple of (player0_action, player1_action).
         """
         # Convert joint action to individual actions
         agent0_action, agent1_action = [
             Action.INDEX_TO_ACTION[a] for a in action
         ]
-
-        if self.agent_idx == 0:
-            joint_action = (agent0_action, agent1_action)
-        else:
-            joint_action = (agent1_action, agent0_action)
+        
+        joint_action = (agent0_action, agent1_action)
 
         # Step the environment
-        next_state, reward, done, env_info = self.base_env.step(joint_action)
+        next_state, reward, done, env_info = self.base_env.step(joint_action, display_phi=True)
+        shaped_reward = reward + env_info['phi_s_prime'] - env_info['phi_s']
         obs_agent0, obs_agent1 = self.featurize_fn(self.base_env, next_state)
 
-        if self.agent_idx == 0:
-            both_agents_ob = (obs_agent0, obs_agent1)
-        else:
-            both_agents_ob = (obs_agent1, obs_agent0)
+        # both_agents_ob = (obs_agent0, obs_agent1)
+        # obs = {
+        #     "both_agent_obs": both_agents_ob,
+        #     "overcooked_state": next_state,
+        #     "other_agent_env_idx": 1 - self.agent_idx,
+        # }
 
-        env_info["policy_agent_idx"] = self.agent_idx
+        # for now, lets just use agent0 observation
+        obs = obs_agent0
+        # print("OBS SHAPE", obs.shape)
 
-        if "episode" in env_info.keys():
-            env_info["episode"]["policy_agent_idx"] = self.agent_idx
+        truncated = False
 
-        obs = {
-            "both_agent_obs": both_agents_ob,
-            "overcooked_state": next_state,
-            "other_agent_env_idx": 1 - self.agent_idx,
-        }
-        return obs, reward, done, env_info
     
-    def reset(self):
+        return obs, shaped_reward, done, truncated, env_info
+    
+    def reset(self, seed=None, options=None):
         """
         When training on individual maps, we want to randomize which agent is assigned to which
         starting location, in order to make sure that the agents are trained to be able to
@@ -128,17 +133,17 @@ class OvercookedSBGym(gym.Env):
         NOTE: a nicer way to do this would be to just randomize starting positions, and not
         have to deal with randomizing indices.
         """
-        self.base_env.reset()
+        self.base_env.reset(regen_mdp=False)
         self.mdp = self.base_env.mdp
-        self.agent_idx = np.random.choice([0, 1])
+        # self.agent_idx = np.random.choice([0, 1])
         ob_p0, ob_p1 = self.featurize_fn(self.base_env, self.base_env.state)
 
-        if self.agent_idx == 0:
-            both_agents_ob = np.concatenate([ob_p0, ob_p1], axis=0).astype(np.float32)
-            # both_agents_ob = (ob_p0, ob_p1)
-        else:
-            both_agents_ob = np.concatenate([ob_p1, ob_p0], axis=0).astype(np.float32)
-            # both_agents_ob = (ob_p1, ob_p0)
+        # if self.agent_idx == 0:
+        #     both_agents_ob = np.concatenate([ob_p0, ob_p1], axis=0).astype(np.float32)
+        #     # both_agents_ob = (ob_p0, ob_p1)
+        # else:
+        #     both_agents_ob = np.concatenate([ob_p1, ob_p0], axis=0).astype(np.float32)
+        #     # both_agents_ob = (ob_p1, ob_p0)
             
         # return {
         #     "both_agent_obs": both_agents_ob,
@@ -146,7 +151,10 @@ class OvercookedSBGym(gym.Env):
         #     "other_agent_env_idx": 1 - self.agent_idx,
         # }
 
-        return both_agents_ob, {"overcooked_state": self.base_env.state, "other_agent_env_idx": 1 - self.agent_idx}
+        # for now, just use agent0_obs for everyting
+        
+        infos = {}
+        return ob_p0, infos #, {"overcooked_state": self.base_env.state, "other_agent_env_idx": 1 - self.agent_idx}
 
 
 class CustomNetwork(BaseFeaturesExtractor):
@@ -154,17 +162,21 @@ class CustomNetwork(BaseFeaturesExtractor):
     Custom neural network for processing joint observations and outputting actions for both agents.
     """
 
-    def __init__(self, observation_space, features_dim=128):
+    def __init__(self, observation_space, features_dim):
         super(CustomNetwork, self).__init__(observation_space, features_dim)
         self.network = nn.Sequential(
-            nn.Conv2d(in_channels=NUM_AGENTS * INPUT_CHANNELS, out_channels=32, kernel_size=5, padding="same"),
+            nn.Conv2d(in_channels=INPUT_CHANNELS, out_channels=25, kernel_size=5, padding="same"),
             nn.LeakyReLU(),
-            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding="valid"),
+            nn.Conv2d(in_channels=25, out_channels=25, kernel_size=3, padding="valid"),
             nn.LeakyReLU(),
-            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, padding="same"),
+            nn.Conv2d(in_channels=25, out_channels=25, kernel_size=3, padding="same"),
             nn.LeakyReLU(),
             nn.Flatten(),
-            nn.Linear(64 * MAX_WIDTH * MAX_HEIGHT, features_dim),
+            nn.Linear(150, 25),
+            nn.LeakyReLU(),
+            nn.Linear(25, 25),
+            nn.LeakyReLU(),
+            nn.Linear(25, features_dim),
             nn.LeakyReLU(),
         )
 
@@ -186,20 +198,18 @@ class PPOTrainer:
         # wandb.init(project="overcooked-ppo", config=self.config.__dict__)
 
         # Initialize environment
-        mdp = OvercookedGridworld.from_layout_name(layout_name=self.config.layout)
-        env = OvercookedEnv.from_mdp(mdp)
-        self.env = OvercookedSBGym(env)
+        self.env = OvercookedSBGym()
 
         # Create a vectorized environment
-        self.vec_env = make_vec_env(lambda: self.env, n_envs=multiprocessing.cpu_count(), vec_env_cls=SubprocVecEnv, ) #vec_env_kwargs=dict(start_method="fork")
+        self.vec_env = make_vec_env(OvercookedSBGym, n_envs=self.config.num_episodes, vec_env_cls=SubprocVecEnv) #, vec_env_kwargs=dict(start_method="fork"))
 
         # Initialize PPO agent with a custom network
         policy_kwargs = dict(
             features_extractor_class=CustomNetwork,
-            features_extractor_kwargs=dict(features_dim=128),
+            features_extractor_kwargs=dict(features_dim=25),
         )
         self.agent = PPO(
-            "MultiInputPolicy",
+            "CnnPolicy",
             # self.env,
             self.vec_env,
             verbose=1,
@@ -207,13 +217,14 @@ class PPOTrainer:
             policy_kwargs=policy_kwargs,
             learning_rate=self.config.learning_rate,
             n_steps=self.config.horizon,
-            batch_size=self.config.horizon * self.config.num_episodes,
+            batch_size=(self.config.horizon * self.config.num_episodes) // self.config.num_mini_batches,
             n_epochs=self.config.num_epochs,
             gamma=self.config.gae_gamma,
             gae_lambda=self.config.gae_lambda,
             clip_range=self.config.clip_param,
             ent_coef=self.config.entropy_coeff_start,
-            max_grad_norm=0.5,
+            max_grad_norm=self.config.max_grad_norm,
+            vf_coef=self.config.vf_loss_coeff,
         )
 
     def train(self, debug=False):
@@ -227,11 +238,12 @@ class PPOTrainer:
                 print(f"\n=========== Training for Iteration {iter} ===========\n")
 
             # Train the agent
-            self.agent.learn(total_timesteps=self.config.horizon * self.config.num_episodes, reset_num_timesteps=False)
+            print("before learn")
+            self.agent.learn(total_timesteps=self.config.horizon * self.config.num_episodes, reset_num_timesteps=False, progress_bar=True)
 
             # Evaluate the agent
-            average_reward_per_episode = self.evaluate()
-            print(f"\n=========== Average Reward per Episode: {average_reward_per_episode} ===========\n")
+            # average_reward_per_episode = self.evaluate()
+            # print(f"\n=========== Average Reward per Episode: {average_reward_per_episode} ===========\n")
             # wandb.log({"Average Reward": average_reward_per_episode, "Iteration": iter})
 
         # wandb.finish()
@@ -241,17 +253,21 @@ class PPOTrainer:
         """
         Evaluate the agent's performance.
         """
-        total_rewards = []
-        for _ in range(self.config.num_episodes):
-            obs = self.env.reset()
-            done = False
-            total_reward = 0
-            while not done:
-                action, _ = self.agent.predict(obs)
-                obs, reward, done, _ = self.env.step(action)
-                total_reward += reward
-            total_rewards.append(total_reward)
-        return np.mean(total_rewards)
+        testobs, _ = self.env.reset()
+        action, _= self.agent.predict(testobs)
+        obs, reward, done, trunc, info = self.vec_env.step(action)
+        print(reward)
+        # total_rewards = []
+        # for _ in range(self.config.num_episodes):
+        #     obs, info = self.env.reset()
+        #     done = False
+        #     total_reward = 0
+        #     for i in range(self.config.horizon):
+        #         action, _ = self.agent.predict(obs)
+        #         obs, reward, done, truc, info_ = self.env.step(action)
+        #         total_reward += reward
+        #     total_rewards.append(total_reward)
+        # return np.mean(total_rewards)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ class Config:
         self.num_mini_batches = 6
         self.reward_shaping_factor = 1.0 
         self.clip_param = 0.05 
-        self.num_episodes = 30
+        self.num_episodes =  30
         self.max_grad_norm = 0.1 
         self.entropy_coeff_start = 0.2
         self.entropy_coeff_end = 0.1
