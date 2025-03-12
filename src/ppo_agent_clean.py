@@ -214,22 +214,21 @@ class PPOAgent(Agent):
     #     return advantages
 
     def compute_GAE(self, rewards, values, dones):
-        last_values = values[:, -1]
-        last_values = last_values.clone().reshape((30, 1))  # type: ignore[assignment]
+        last_values = values[:, -1].reshape((self.config.num_episodes, 1))  # type: ignore[assignment]
 
-        advantages = torch.zeros((30, 400), dtype=torch.float32)
+        advantages = torch.zeros((self.config.num_episodes, 400), dtype=torch.float32, device=self.device)
 
-        last_gae_lam = 0
-        for step in reversed(range(400)):
-            if step == 400 - 1:
-                next_non_terminal = 1.0 - dones[:,-1].reshape((30,1))
+        last_gae_lam = torch.zeros((self.config.num_episodes, 1), device=self.device)
+        for step in reversed(range(self.config.horizon)):
+            if step == self.config.horizon - 1:
+                next_non_terminal = 1.0 - dones[:,-1].reshape((self.config.num_episodes,1))
                 next_values = last_values
             else:
-                next_non_terminal = 1.0
-                next_values = values[:, step + 1]
+                next_non_terminal = torch.ones((self.config.num_episodes, 1), device=self.device)
+                next_values = values[:, step + 1].reshape((self.config.num_episodes, 1))
 
-            delta = rewards[:, step].reshape((30, 1)) + self.config.gae_gamma * next_values.reshape((30, 1)) * next_non_terminal - values[:, step].reshape((30, 1))
-            last_gae_lam = delta.reshape((30, 1)) + self.config.gae_gamma * self.config.gae_lambda * next_non_terminal * last_gae_lam
+            delta = rewards[:, step].reshape((self.config.num_episodes, 1)) + self.config.gae_gamma * next_values * next_non_terminal - values[:, step].reshape((self.config.num_episodes, 1))
+            last_gae_lam = delta + self.config.gae_gamma * self.config.gae_lambda * next_non_terminal * last_gae_lam
 
             advantages[:, step] = last_gae_lam.flatten()
         return advantages
@@ -460,8 +459,8 @@ class PPOTrainer:
             advantages_p0 = self.agent0.compute_GAE(shaped_rewards_tensor0, values_p0, dones) # TODO for cleanup, can move the "get_value_estimate" to the compute_GAE function
             advantages_p1 = self.agent1.compute_GAE(shaped_rewards_tensor1, values_p1, dones)
 
-            returns_p0 = values_p0 + advantages_p0.view((-1, 1))
-            returns_p1 = values_p1 + advantages_p1.view((-1, 1))
+            returns_p0 = values_p0 + advantages_p0
+            returns_p1 = values_p1 + advantages_p1
 
             # Flatten for batch processing - State 
             state_p0_batch = state_p0_tensor.view(-1, *state_p0_tensor.shape[-3:])
