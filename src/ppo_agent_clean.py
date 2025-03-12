@@ -47,6 +47,22 @@ class PPONetwork(nn.Module):
         # Device: Cuda, CPU, or MPS 
         self.device = device
 
+        self.network = nn.Sequential(
+            nn.Conv2d(in_channels=INPUT_CHANNELS, out_channels=25, kernel_size=5, padding="same"),
+            nn.LeakyReLU(),
+            nn.Conv2d(in_channels=25, out_channels=25, kernel_size=3, padding="valid"),
+            nn.LeakyReLU(),
+            nn.Conv2d(in_channels=25, out_channels=25, kernel_size=3, padding="same"),
+            nn.LeakyReLU(),
+            nn.Flatten(),
+            nn.Linear(150, 32),
+            nn.LeakyReLU(),
+            nn.Linear(32, 32),
+            nn.LeakyReLU(),
+            nn.Linear(32, 32),
+            nn.LeakyReLU(),
+        )
+
         # Actor: responsible for selecting actions based on the current policy
         self.actor = nn.Sequential(
             nn.Conv2d(in_channels=input_channels, out_channels=25, kernel_size=5, padding="same"),
@@ -162,40 +178,63 @@ class PPOAgent(Agent):
         info = {'og_distribution': distribution.probs, 'og_log_probs': og_log_probs}
         return action, info  
     
-    def compute_GAE(self, returns, values, dones):
-        """
-        Computes the generalized advantage estimator (GAE), a weighted sum of future TD errors. 
-        GAE reduces the variance of policy gradient estimates to improve efficiency and stability of training. 
+    # def compute_GAE(self, rewards, values, dones):
+    #     """
+    #     Computes the generalized advantage estimator (GAE), a weighted sum of future TD errors. 
+    #     GAE reduces the variance of policy gradient estimates to improve efficiency and stability of training. 
         
-        Advantage Function: A(s_t, a_t) = Q(s_t, a_t) - V(s_t), measures how much better or worse action a is compared to the expected value of the state.
+    #     Advantage Function: A(s_t, a_t) = Q(s_t, a_t) - V(s_t), measures how much better or worse action a is compared to the expected value of the state.
 
-        Returns advantages, which contains the GAE for each timestep in the trajectory.
-        """
-        # Number of timesteps
-        total_time_steps = len(dones)
+    #     Returns advantages, which contains the GAE for each timestep in the trajectory.
+    #     """
+    #     # Number of timesteps
+    #     total_time_steps = len(dones)
     
-        # Advantages, initialized to 0
-        advantages = torch.zeros_like(returns, device = self.device)
+    #     # Advantages, initialized to 0
+    #     advantages = torch.zeros_like(rewards, device = self.device)
 
-        # The next GAE value to propagate back 
-        next_gae = torch.zeros_like(returns[-1], device=self.device)
+    #     # The next GAE value to propagate back 
+    #     next_gae = torch.zeros_like(rewards[-1], device=self.device)
         
-        for ts in reversed(range(total_time_steps)):
-            if ts == total_time_steps - 1:
-                # For the last timestep, the bootstrap value should be zero only if the episode terminates
-                bootstrap_value = values[ts] * (1 - dones[ts])
-                delta = returns[ts] + self.config.gae_gamma * bootstrap_value - values[ts]
-            else:
-                # Calculate TD error for each timestep 
-                delta = returns[ts] + self.config.gae_gamma * values[ts + 1] * (1 - dones[ts]) - values[ts]
+    #     for ts in reversed(range(total_time_steps)):
+    #         if ts == total_time_steps - 1:
+    #             # For the last timestep, the bootstrap value should be zero only if the episode terminates
+    #             bootstrap_value = values[ts] * (1 - dones[ts])
+    #             delta = rewards[ts] + self.config.gae_gamma * bootstrap_value - values[ts]
+    #         else:
+    #             # Calculate TD error for each timestep 
+    #             delta = rewards[ts] + self.config.gae_gamma * values[ts + 1] * (1 - dones[ts]) - values[ts]
             
-            # Update the advantage for the current timestep using the recursive formula
-            advantages[ts] = delta + self.config.gae_gamma * self.config.gae_lambda * next_gae * (1 - dones[ts])
+    #         # Update the advantage for the current timestep using the recursive formula
+    #         advantages[ts] = delta + self.config.gae_gamma * self.config.gae_lambda * next_gae * (1 - dones[ts])
 
-            # Update next_gae for the next iteration
-            next_gae = advantages[ts]
+    #         # Update next_gae for the next iteration
+    #         next_gae = advantages[ts]
         
+    #     return advantages
+
+    def compute_GAE(self, rewards, values, dones):
+        last_values = values[:, -1]
+        last_values = last_values.clone().reshape((30, 1))  # type: ignore[assignment]
+
+        advantages = torch.zeros((30, 400), dtype=torch.float32)
+
+        last_gae_lam = 0
+        for step in reversed(range(400)):
+            if step == 400 - 1:
+                next_non_terminal = 1.0 - dones[:,-1].reshape((30,1))
+                next_values = last_values
+            else:
+                next_non_terminal = 1.0
+                next_values = values[:, step + 1]
+
+            delta = rewards[:, step].reshape((30, 1)) + self.config.gae_gamma * next_values.reshape((30, 1)) * next_non_terminal - values[:, step].reshape((30, 1))
+            last_gae_lam = delta.reshape((30, 1)) + self.config.gae_gamma * self.config.gae_lambda * next_non_terminal * last_gae_lam
+
+            advantages[:, step] = last_gae_lam.flatten()
         return advantages
+
+
     
     def update_policy(self, observations, actions, advantages, returns, old_action_log_prob, entropy_coeff_current=None, debug=False):
         """
@@ -284,24 +323,6 @@ class PPOTrainer:
         current_coeff = self.config.entropy_coeff_start - (self.config.entropy_coeff_start - self.config.entropy_coeff_end) * decay_fraction
         return current_coeff
 
-    def get_returns(self, rewards, discount_factor_gamma=1):
-        """
-        Calculate the returns G_t for each timestep: G_t = r_t + γ r_{t+1} + γ^2 r_{t+2} + ... + γ^{T-t} r_T.
-        Note: Due to finite horizon, we let discount_factor_gamma = 1.
-        """
-        all_returns = []
-        for episode_rewards in rewards:
-            returns = np.zeros_like(episode_rewards, dtype=np.float32)
-            cumulative_return = 0.0
-            
-            # Traverse the rewards in reverse order to accumulate the returns
-            for t in reversed(range(len(episode_rewards))):
-                cumulative_return = episode_rewards[t] + discount_factor_gamma * cumulative_return
-                returns[t] = cumulative_return
-            all_returns.append(returns)
-        
-        return torch.tensor(np.stack(all_returns))
-
     def collect_trajectories(self):
         """
         Collect trajectories from the environment. 
@@ -368,44 +389,51 @@ class PPOTrainer:
             # self.agent1.network.to(self.device)
             
             # Extract old log probabilities and rewards
-            dense_rewards, old_log_probs_p0, old_log_probs_p1 = [], [], []
+            dense_rewards0, dense_rewards1, old_log_probs_p0, old_log_probs_p1 = [], [], [], []
             for game in range(self.config.num_episodes):
-                curr_reward = [info['phi_s_prime'] - info['phi_s'] for info in infos[game]]
+                # curr_reward = [info['phi_s_prime'] - info['phi_s'] for info in infos[game]]
+                curr_reward0 = [info["shaped_r_by_agent"][0] for info in infos[game]]
+                curr_reward1 = [info["shaped_r_by_agent"][1] for info in infos[game]]
                 og_log_p0 = [info['agent_infos'][0]['og_log_probs'] for info in infos[game]]
                 og_log_p1 = [info['agent_infos'][1]['og_log_probs'] for info in infos[game]]
-                dense_rewards.append(curr_reward)
+                dense_rewards0.append(curr_reward0)
+                dense_rewards1.append(curr_reward1)
                 old_log_probs_p0.append(og_log_p0)
                 old_log_probs_p1.append(og_log_p1)
 
             # Convert to tensors 
-            dense_rewards = torch.tensor(dense_rewards, dtype=torch.float32)
+            dense_rewards0 = torch.tensor(dense_rewards0, dtype=torch.float32)
+            dense_rewards1 = torch.tensor(dense_rewards1, dtype=torch.float32)
+            # dense_rewards = torch.tensor(dense_rewards, dtype=torch.float32)
                    
             # TODO: Ignore dense_rewards and shaped_rewards for now
-            shaped_rewards_tensor = sparse_rewards_tensor + dense_rewards * self.config.reward_shaping_factor
+            shaped_rewards_tensor0 = sparse_rewards_tensor + dense_rewards0 * self.config.reward_shaping_factor
+            shaped_rewards_tensor1 = sparse_rewards_tensor + dense_rewards1 * self.config.reward_shaping_factor
 
-            print(shaped_rewards_tensor.type)
+
+            # print(shaped_rewards_tensor.type)
             # shaped_rewards_tensor = sparse_rewards_tensor
 
             #### DUMMY CHECK #### - STAY IN PLACE REWARD
-            step_num = 0
-            episode_rewards = [] 
-            for episode in action_tensor:
-                if step_num == 0:
-                    print(episode[:10])
-                    step_num += 1
-                horizon_rewards = [] 
-                for time_step in episode:
-                    curr_reward = 0 
-                    for action_pair in time_step:
-                        if action_pair.item() == 4: 
-                            curr_reward += 1
-                    horizon_rewards.append(curr_reward)
-                episode_rewards.append(np.array(horizon_rewards))
+            # step_num = 0
+            # episode_rewards = [] 
+            # for episode in action_tensor:
+            #     if step_num == 0:
+            #         print(episode[:10])
+            #         step_num += 1
+            #     horizon_rewards = [] 
+            #     for time_step in episode:
+            #         curr_reward = 0 
+            #         for action_pair in time_step:
+            #             if action_pair.item() == 4: 
+            #                 curr_reward += 1
+            #         horizon_rewards.append(curr_reward)
+            #     episode_rewards.append(np.array(horizon_rewards))
 
-            shaped_rewards_tensor = torch.tensor(episode_rewards, dtype=torch.float32)
-            #### DUMMY CHECK #### - STAY IN PLACE REWARD
+            # shaped_rewards_tensor = torch.tensor(np.array(episode_rewards), dtype=torch.float32)
+            # #### DUMMY CHECK #### - STAY IN PLACE REWARD
 
-            average_reward_per_episode = shaped_rewards_tensor.sum(axis=1).mean()
+            average_reward_per_episode = shaped_rewards_tensor0.sum(axis=1).mean()
             print("\n=========== Average Reward per Episode: ===========\n", average_reward_per_episode.item())
             wandb.log({"Average Reward": average_reward_per_episode, "Iteration": iter})
             
@@ -413,19 +441,27 @@ class PPOTrainer:
             state_p0_tensor = state_p0_tensor.to(self.device)
             state_p1_tensor = state_p1_tensor.to(self.device)
 
-            # Compute returns and value estimates 
-            returns = self.get_returns(shaped_rewards_tensor)
+            # Compute value estimates (already on GPU)
             values_p0 = self.agent0._get_value_estimate(state_p0_tensor.view(-1, INPUT_CHANNELS, MAX_WIDTH, MAX_HEIGHT))
             values_p1 = self.agent1._get_value_estimate(state_p1_tensor.view(-1, INPUT_CHANNELS, MAX_WIDTH, MAX_HEIGHT))
 
             # Convert dones to tensor and move to device
             dones = torch.tensor(dones.astype(np.int64)).to(self.device)
-            # move returns to device
-            returns = returns.to(self.device)
+            # move rewards and values to device
+            shaped_rewards_tensor0 = shaped_rewards_tensor0.to(self.device)
+            shaped_rewards_tensor1 = shaped_rewards_tensor1.to(self.device)
+            # shaped_rewards_tensor = shaped_rewards_tensor.to(self.device)
+
+            # shape values into epsiode form
+            values_p0 = values_p0.view(self.config.num_episodes, self.config.horizon)
+            values_p1 = values_p1.view(self.config.num_episodes, self.config.horizon)
 
             # Compute advantages 
-            advantages_p0 = self.agent0.compute_GAE(returns, values_p0, dones) # TODO for cleanup, can move the "get_value_estimate" to the compute_GAE function
-            advantages_p1 = self.agent1.compute_GAE(returns, values_p1, dones)
+            advantages_p0 = self.agent0.compute_GAE(shaped_rewards_tensor0, values_p0, dones) # TODO for cleanup, can move the "get_value_estimate" to the compute_GAE function
+            advantages_p1 = self.agent1.compute_GAE(shaped_rewards_tensor1, values_p1, dones)
+
+            returns_p0 = values_p0 + advantages_p0.view((-1, 1))
+            returns_p1 = values_p1 + advantages_p1.view((-1, 1))
 
             # Flatten for batch processing - State 
             state_p0_batch = state_p0_tensor.view(-1, *state_p0_tensor.shape[-3:])
@@ -438,8 +474,9 @@ class PPOTrainer:
             action_p1_batch = action_tensor_joint[:, 1] 
 
             # Flatten for batch processing 
-            returns_batch = returns.view((-1, 1)) 
-            assert returns_batch.shape == (self.config.horizon * self.config.num_episodes, 1)
+            returns_batch0 = returns_p0.view((-1, 1))
+            returns_batch1 = returns_p1.view((-1, 1))
+            assert returns_batch0.shape == returns_batch1.shape == (self.config.horizon * self.config.num_episodes, 1)
 
             # Flatten for batch processing - Dones 
             dones_batch = dones.view(-1, 1)
@@ -458,7 +495,8 @@ class PPOTrainer:
             # detach and remove from gradient tracking
             action_p0_batch = action_p0_batch.detach().requires_grad_(False)
             action_p1_batch = action_p1_batch.detach().requires_grad_(False)
-            returns_batch = returns_batch.detach().requires_grad_(False)
+            returns_p0_batch = returns_batch0.detach().requires_grad_(False)
+            returns_p1_batch = returns_batch1.detach().requires_grad_(False)
             advantages_p0_batch = advantages_p0_batch.detach().requires_grad_(False)
             advantages_p1_batch = advantages_p1_batch.detach().requires_grad_(False)
             old_log_probs_p0_batch = old_log_probs_p0_batch.detach().requires_grad_(False)
@@ -468,7 +506,8 @@ class PPOTrainer:
             # Move to device 
             action_p0_batch = action_p0_batch.to(self.device)
             action_p1_batch = action_p1_batch.to(self.device)
-            returns_batch = returns_batch.to(self.device)
+            returns_p0_batch = returns_p0_batch.to(self.device)
+            returns_p1_batch = returns_p1_batch.to(self.device)
             advantages_p0_batch = advantages_p0_batch.to(self.device)
             advantages_p1_batch = advantages_p1_batch.to(self.device)
             old_log_probs_p0_batch = old_log_probs_p0_batch.to(self.device)
@@ -491,7 +530,8 @@ class PPOTrainer:
                     curr_state_tensor_p1 = state_p1_batch[shuffled_indices]
                     curr_action_tensor_p0 = action_p0_batch[shuffled_indices]
                     curr_action_tensor_p1 = action_p1_batch[shuffled_indices]
-                    curr_returns = returns_batch[shuffled_indices]
+                    curr_returns_p0 = returns_p0_batch[shuffled_indices]
+                    curr_returns_p1 = returns_p1_batch[shuffled_indices]
                     curr_advantages_p0 = advantages_p0_batch[shuffled_indices]
                     curr_advantages_p1 = advantages_p1_batch[shuffled_indices]
                     curr_old_log_probs_p0 = old_log_probs_p0_batch[shuffled_indices]
@@ -506,7 +546,8 @@ class PPOTrainer:
                         state_tensor_p1_minibatch = curr_state_tensor_p1[start:end]
                         action_tensor_p0_minibatch = curr_action_tensor_p0[start:end]
                         action_tensor_p1_minibatch = curr_action_tensor_p1[start:end]
-                        returns_minibatch = curr_returns[start:end]
+                        returns_p0_minibatch = curr_returns_p0[start:end]
+                        returns_p1_minibatch = curr_returns_p1[start:end]
                         advantages_p0_minibatch = curr_advantages_p0[start:end]
                         advantages_p1_minibatch = curr_advantages_p1[start:end]
                         old_log_probs_p0_minibatch = curr_old_log_probs_p0[start:end]
@@ -514,8 +555,8 @@ class PPOTrainer:
                         dones_minibatch = curr_dones[start:end]
                         
                         # Update policy 
-                        self.agent0.update_policy(state_tensor_p0_minibatch, action_tensor_p0_minibatch, advantages_p0_minibatch, returns_minibatch, old_log_probs_p0_minibatch, entropy_coeff_current=entropy_coeff_current, debug=True)
-                        self.agent1.update_policy(state_tensor_p1_minibatch, action_tensor_p1_minibatch, advantages_p1_minibatch, returns_minibatch, old_log_probs_p1_minibatch, entropy_coeff_current=entropy_coeff_current, debug=False)
+                        self.agent0.update_policy(state_tensor_p0_minibatch, action_tensor_p0_minibatch, advantages_p0_minibatch, returns_p0_minibatch, old_log_probs_p0_minibatch, entropy_coeff_current=entropy_coeff_current, debug=True)
+                        self.agent1.update_policy(state_tensor_p1_minibatch, action_tensor_p1_minibatch, advantages_p1_minibatch, returns_p1_minibatch, old_log_probs_p1_minibatch, entropy_coeff_current=entropy_coeff_current, debug=False)
                         
                         # Update progress bar
                         progress_bar.update(1)
