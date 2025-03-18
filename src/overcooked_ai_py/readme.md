@@ -1,0 +1,1 @@
+All code from this folder is forked from Carroll et. al.'s repository, [`overcooked_ai`](https://github.com/HumanCompatibleAI/overcooked_ai).
